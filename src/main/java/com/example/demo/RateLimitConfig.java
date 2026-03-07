@@ -76,6 +76,17 @@ public class RateLimitConfig {
     }
 
     /**
+     * Creates a String-String stateful connection for HybridRateLimitService.
+     * This is used for Lua script execution and general Redis operations.
+     */
+    @Bean(destroyMethod = "close")
+    public StatefulRedisConnection<String, String> redisStringConnection(RedisClient redisClient) {
+        StatefulRedisConnection<String, String> connection = redisClient.connect(StringCodec.UTF8);
+        connection.setAutoFlushCommands(true);
+        return connection;
+    }
+
+    /**
      * Creates a ProxyManager for managing distributed buckets in Redis.
      * Optimized for high throughput with efficient expiration strategy.
      */
