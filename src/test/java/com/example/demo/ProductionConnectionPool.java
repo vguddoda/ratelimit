@@ -44,7 +44,52 @@ public class ProductionConnectionPool implements DataSource {
 
     // Core pool components
     private final Semaphore connectionSemaphore;
+
+    /**
+     * Queue of available (idle) connections ready to be borrowed.
+     *
+     * Lifecycle:
+     * - Connections START here when pool is initialized
+     * - REMOVED when thread calls getConnection()
+     * - RETURNED when thread calls close() (via ConnectionProxy)
+     *
+     * Thread-safe: ConcurrentLinkedQueue allows lock-free operations
+     *
+     * Example flow:
+     * 1. Pool init: [C1, C2, C3, C4, C5] (5 available)
+     * 2. Thread-A gets connection: [C2, C3, C4, C5] (C1 leased)
+     * 3. Thread-A closes connection: [C2, C3, C4, C5, C1] (C1 returned)
+     */
     private final ConcurrentLinkedQueue<PooledConnection> availableConnections;
+
+    /**
+     * Map of leased (borrowed/in-use) connections for tracking and leak detection.
+     *
+     * Key: Raw Connection object (the actual JDBC connection)
+     *      WHY Connection as key? Because when thread calls conn.close(), we need to
+     *      look up the corresponding PooledConnection to get its metadata (leaseTime,
+     *      stackTrace). The thread has the Connection object, so we use it for lookup.
+     *
+     * Value: PooledConnection wrapper (contains metadata: leaseTime, stackTrace)
+     *
+     * Purpose:
+     * 1. LEAK DETECTION: Track how long each connection is held
+     *    - If held > threshold (e.g., 60s), log WARNING with stack trace
+     *    - Stack trace shows WHERE connection was acquired
+     *
+     * 2. METRICS: Count active connections (size of this map)
+     *
+     * 3. GRACEFUL SHUTDOWN: Check if any connections still in use
+     *
+     * Lifecycle:
+     * - Connection ADDED when getConnection() returns to thread
+     * - Connection REMOVED when close() called (returned to pool)
+     *
+     * Example:
+     * Thread-1: getConnection() → {C1 → PooledConnection(leaseTime=1234567890, stackTrace=...)}
+     * Thread-2: getConnection() → {C1 → ..., C2 → PooledConnection(leaseTime=1234567900, ...)}
+     * Thread-1: close()        → {C2 → ...} (C1 removed, returned to availableConnections)
+     */
     private final ConcurrentHashMap<Connection, PooledConnection> leasedConnections;
 
     // Background maintenance
