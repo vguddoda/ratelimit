@@ -261,6 +261,146 @@ while (true) {
 }
 ```
 
+### The CAS Loop — Step by Step (How It Actually Solves the Problem)
+
+The problem CAS solves: two threads both read `current=1000`, both try to write `999` — one of them must **lose and retry**, not silently succeed with a corrupt value.
+
+Here is exactly what happens for **3 threads competing** (easier to trace than 5000):
+
+```
+available = 1000
+
+─── Thread A ───────────────────────────────────────────────────────────────
+Step 1: current = available.get()    → current = 1000
+Step 2: current > 0? YES, continue
+Step 3: compareAndSet(1000, 999)
+          CPU checks: is memory still 1000?
+          YES → writes 999 atomically → returns true
+          available is now 999
+Step 4: return true ✅  (Thread A consumed a token)
+
+
+─── Thread B (ran simultaneously with A) ───────────────────────────────────
+Step 1: current = available.get()    → current = 1000   ← read SAME value as A!
+Step 2: current > 0? YES, continue
+Step 3: compareAndSet(1000, 999)
+          CPU checks: is memory still 1000?
+          NO — Thread A already changed it to 999!
+          → returns false. available unchanged.
+          ← CAS FAILED
+Step 4: // loop retries automatically
+
+Step 1 (retry): current = available.get()  → current = 999   ← sees updated value
+Step 2: current > 0? YES
+Step 3: compareAndSet(999, 998)
+          CPU checks: is memory still 999?
+          YES → writes 998 → returns true
+Step 4: return true ✅  (Thread B consumed a token)
+
+
+─── Thread C (also ran simultaneously) ─────────────────────────────────────
+Step 1: current = available.get()    → current = 1000
+Step 3: compareAndSet(1000, 999)  → FAILS (A already wrote 999)
+Retry:
+Step 1: current = available.get()    → current = 999
+Step 3: compareAndSet(999, 998)   → FAILS (B already wrote 998)
+Retry:
+Step 1: current = available.get()    → current = 998
+Step 3: compareAndSet(998, 997)   → WINS
+Step 4: return true ✅
+
+FINAL: available = 997. Exactly 3 tokens consumed. No double-spend.
+```
+
+**The guarantee:** `compareAndSet(expected, new)` is ONE CPU instruction (`LOCK CMPXCHG`).  
+The CPU checks AND writes in one atomic step — no other thread can sneak in between the check and the write.
+
+```
+WITHOUT CAS (broken):                    WITH CAS (correct):
+─────────────────────────────────────    ─────────────────────────────
+Thread A: read 1000                      Thread A: CAS(1000→999) WINS ✅
+Thread B: read 1000   ← same value!     Thread B: CAS(1000→999) FAILS
+Thread A: write 999                        Thread B retries
+Thread B: write 999   ← overwrites A!     Thread B: CAS(999→998) WINS ✅
+Result: available=999 (should be 998!)   Result: available=998 ✅
+```
+
+### What "Lost the CAS" Means Concretely
+
+```java
+long current = available.get();            // Step 1: I read 1000
+
+// ← RIGHT HERE another thread can change available from 1000 to 999
+
+if (available.compareAndSet(current,       // Step 2: Is it STILL 1000?
+                            current - 1)) {
+    return true;   // YES → I wrote 999. I win.
+}
+// NO → someone else changed it. My write is rejected. I retry.
+```
+
+The gap between Step 1 (read) and Step 2 (CAS) is where races happen.  
+CAS detects the race and refuses to write if the value changed. That's the entire trick.
+
+### Why the While(true) Loop?
+
+A thread might need to retry many times if there's heavy contention:
+
+```
+available = 100, threads = 1000
+
+Thread 1: read 100, CAS(100→99)  WINS  → available=99
+Thread 2: read 100, CAS(100→99)  FAILS → retry, read 99, CAS(99→98) WINS
+Thread 3: read 100, CAS(100→99)  FAILS → retry, read 99, CAS(99→98) FAILS
+                                        → retry, read 98, CAS(98→97) WINS
+...
+
+Worst case: a thread retries O(N) times where N = number of competing threads
+But each retry is ~5ns (one CPU instruction) — even 100 retries = 500ns
+Compare to: 1 context switch = 5,000ns (10x more expensive than 1000 retries)
+```
+
+The `while(true)` is a **spin loop** — the thread stays active on the CPU, retrying at CPU speed rather than going to sleep and waiting for a wakeup signal.
+
+### Thread.onSpinWait() — Why It's There
+
+```java
+Thread.onSpinWait();   // Added after a failed CAS
+```
+
+This is a JVM hint — translates to `PAUSE` instruction on x86:
+- Tells CPU "I am spinning, this is intentional"
+- CPU reduces power consumption (doesn't speculate ahead aggressively)
+- Prevents memory pipeline hazards — without it, the CPU's store-forwarding can cause unnecessary cache invalidation storms across CPU cores
+- On a 4-core machine with 4 threads all spinning: without `onSpinWait()` they hammer the memory bus; with it, the hardware slows each spinning thread slightly so the one that wins can complete faster
+
+In practice: small but real performance improvement under high contention.
+
+### What Happens When available Reaches 0
+
+```java
+while (true) {
+    long current = available.get();
+
+    if (current <= 0) return false;   // ← EXIT: no retry, immediate denial
+    ...
+}
+```
+
+Once `available = 0`, ALL threads hit the `current <= 0` check and return `false` immediately — no CAS attempted, no spinning. This is the happy path for rejected requests (fast denial).
+
+### Summary: Why This Is Safe
+
+```
+Race condition possible?  NO — compareAndSet is ONE atomic CPU instruction
+Over-consumption?         NO — only the thread that wins CAS decrements
+Under-consumption?        NO — failed threads retry until success or 0
+Blocking?                 NO — threads spin at CPU speed (nanoseconds)
+Deadlock?                 NO — no locks, nothing to deadlock on
+Starvation?               Theoretically possible but extremely rare at 5k threads
+                          (each thread wins within a handful of retries statistically)
+```
+
 ### What Happens with 5000 Concurrent Threads
 
 ```

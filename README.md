@@ -34,6 +34,55 @@ Client Request
 
 ---
 
+## Study Order
+
+### Phase 1 — Concurrency (`CONCURRENCY_DEEP_DIVE.md`)
+
+Read in this sequence — each concept builds on the previous:
+
+```
+1. The Problem       §1  → why count++ breaks under concurrency (3 CPU ops, not 1)
+2. Mutex             §2  → OS blocking, context switch ~5μs, when to use
+3. Semaphore         §3  → counting lock (N threads), connection pool model
+4. ReentrantLock     §4  → explicit mutex + tryLock() — used in rate limiter
+5. ReadWriteLock     §5  → concurrent reads OR exclusive write
+6. CAS / Lock-Free   §6  → x86 LOCK CMPXCHG, 5k concurrent threads, 200k TPS
+7. Deadlock          §7  → create one, detect via jstack, fix via lock ordering
+8. Thread States     §8  → NEW→RUNNABLE→BLOCKED/WAITING→TERMINATED + context switch
+9. Connection Pool   §9  → Semaphore in practice, ConcurrentHashMap<Connection,…> key
+10. Why CAS here     §10 → decision table: why not synchronized/semaphore/locks
+```
+
+**Before moving to Phase 2, make sure you can answer:**
+- What is a context switch and why does it cost ~5μs?
+- Why does CAS never block a thread?
+- What is BLOCKED vs WAITING thread state?
+- Why is Semaphore right for connection pooling but wrong for rate limiting tokens?
+
+---
+
+### Phase 2 — Rate Limiting 45k TPS (`RATELIMIT_SYSTEM_DESIGN.md`)
+
+Now the rate limiter makes full sense — CAS, ReentrantLock, Lua atomicity all connect:
+
+```
+1. Why Not Pure Redis  §1  → 45k TPS = 45k Redis ops → bottleneck math
+2. APISIX Config       §2  → jwt-auth → extract tenant_id → chash upstream → headless K8s
+3. Consistent Hashing  §3  → same tenant → same pod → local cache hits 90%+
+4. Hybrid Algorithm    §4  → CAS loop (local) + Lua script (Redis) + ReentrantLock (sync)
+5. 5k Concurrent       §4  → thread-by-thread walkthrough of what CAS does
+6. Failure Scenarios   §5  → Redis down/slow/split-brain, pod crash, pod scaling
+7. Interview Q&A       §7  → how to articulate design decisions under interview pressure
+```
+
+**Checkpoint questions:**
+- Why does 10% chunk size give 99% fewer Redis calls?
+- How do exactly 1000 of 5000 threads succeed — and not 1001?
+- What happens step-by-step when Redis goes down mid-traffic?
+- Why Lua script instead of GET + HINCRBY as two separate commands?
+
+---
+
 ## Files in This Repo
 
 | File | Purpose |
