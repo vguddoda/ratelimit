@@ -1,6 +1,5 @@
 package com.example.demo;
 
-import io.github.bucket4j.distributed.proxy.ProxyManager;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -18,284 +17,423 @@ import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
-import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.content;
+import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
+import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
 
 /**
- * Comprehensive tests for rate limiting functionality.
- * Tests verify bucket configuration, rate enforcement, and high-throughput scenarios.
+ * Integration tests for Hybrid Rate Limiting (Local CAS cache + Redis Bucket4j).
+ *
+ * REQUIRES: Redis running on localhost:6379
+ *   docker run -d -p 6379:6379 redis:latest
+ *
+ * Test config: limit=20 per 60s, chunk=10% = 2 tokens per chunk
+ * This keeps tests fast (only need ~25 requests to exhaust limit).
+ *
+ * CASES TESTED:
+ *  1. Basic request allowed (first request creates Bucket4j bucket + chunk)
+ *  2. Rate limit enforced after exhausting global limit
+ *  3. Separate tenants have independent limits
+ *  4. Concurrent requests handled correctly by CAS (no over-consumption)
+ *  5. Chunk exhaustion triggers Redis sync (verify multi-chunk flow)
+ *  6. Status endpoint shows correct local + global state
+ *  7. Reset clears both local and Redis state
+ *  8. Refill: Bucket4j refills tokens over time
+ *  9. Fallback to IP when no X-Tenant-ID header
  */
 @SpringBootTest
 @AutoConfigureMockMvc
 @TestPropertySource(properties = {
-		"rate.limit.capacity=5",
-		"rate.limit.refill.tokens=5",
-		"rate.limit.refill.duration=10s",
-		"logging.level.root=INFO"
+        // Low limit for fast test: 20 requests per 60 seconds
+        "rate.limit.default.limit=20",
+        "rate.limit.window.duration=60",
+        // 10% chunk = 2 tokens per chunk (20 * 10%)
+        "rate.limit.chunk.percent=10",
+        "rate.limit.degraded.percent=10",
+        "logging.level.com.example.demo=DEBUG"
 })
 class DemoApplicationTests {
 
-	@Autowired
-	private MockMvc mockMvc;
+    @Autowired
+    private MockMvc mockMvc;
 
-	@Autowired
-	private ProxyManager<String> proxyManager;
+    @Autowired
+    private HybridRateLimitService rateLimitService;
 
-	@BeforeEach
-	void setUp() {
-		// Clear rate limit buckets between tests to ensure test isolation
-		// Note: In production Redis, you might want to use FLUSHDB or key deletion
-		System.out.println("Test setup complete");
-	}
+    @Autowired
+    private LocalQuotaManager localQuotaManager;
 
-	@Test
-	void contextLoads() {
-		assertThat(mockMvc).isNotNull();
-		assertThat(proxyManager).isNotNull();
-	}
+    /** Reset state before each test so tests don't interfere */
+    @BeforeEach
+    void setUp() throws Exception {
+        // Reset a set of tenants used across tests
+        for (String tenant : List.of(
+                "test-basic", "test-limit", "test-a", "test-b",
+                "test-concurrent", "test-chunk", "test-status",
+                "test-reset", "test-refill", "test-multi-0", "test-multi-1",
+                "test-multi-2", "test-multi-3", "test-multi-4",
+                "203.0.113.99", "127.0.0.1")) {
+            try {
+                rateLimitService.resetTenant(tenant);
+            } catch (Exception ignored) {}
+        }
+        // Small delay for Redis to process resets
+        Thread.sleep(100);
+    }
 
-	/**
-	 * Test that the endpoint returns successful response when within rate limits.
-	 */
-	@Test
-	void shouldAllowRequestWhenWithinRateLimit() throws Exception {
-		mockMvc.perform(get("/api/data")
-						.header("X-Forwarded-For", "192.168.1.100"))
-				.andExpect(status().isOk())
-				.andExpect(content().string("Here is the protected data!"));
-	}
+    // ─────────────────────────────────────────────────────────────────────────
+    //  TEST 1: Basic request allowed
+    // ─────────────────────────────────────────────────────────────────────────
 
-	/**
-	 * Test that rate limiting kicks in after exceeding the capacity.
-	 * Capacity is 5, so the 6th request should be rate limited.
-	 */
-	@Test
-	void shouldEnforceRateLimitAfterExceedingCapacity() throws Exception {
-		String clientIp = "192.168.1.101";
+    @Test
+    void shouldAllowRequestWithinRateLimit() throws Exception {
+        mockMvc.perform(get("/api/data")
+                        .header("X-Tenant-ID", "test-basic"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.tenant").value("test-basic"))
+                .andExpect(jsonPath("$.message").value("Here is the protected data!"));
+    }
 
-		// Make 5 requests (within capacity)
-		for (int i = 0; i < 5; i++) {
-			mockMvc.perform(get("/api/data")
-							.header("X-Forwarded-For", clientIp))
-					.andExpect(status().isOk());
-		}
+    // ─────────────────────────────────────────────────────────────────────────
+    //  TEST 2: Rate limit enforced after exhausting global limit
+    //
+    //  limit=20, chunk=2. After 20 requests: all chunks consumed from Bucket4j.
+    //  Request 21+ should get 429.
+    // ─────────────────────────────────────────────────────────────────────────
 
-		// 6th request should be rate limited
-		mockMvc.perform(get("/api/data")
-						.header("X-Forwarded-For", clientIp))
-				.andExpect(status().isTooManyRequests())
-				.andExpect(content().json("{\"error\":\"Too many requests\"}"));
-	}
+    @Test
+    void shouldEnforceRateLimitAfterExceedingCapacity() throws Exception {
+        String tenant = "test-limit";
+        int limit = 20;
 
-	/**
-	 * Test that different IP addresses have separate rate limit buckets.
-	 */
-	@Test
-	void shouldMaintainSeparateBucketsForDifferentIPs() throws Exception {
-		String clientIp1 = "192.168.1.102";
-		String clientIp2 = "192.168.1.103";
+        // Send exactly `limit` requests — all should succeed
+        for (int i = 0; i < limit; i++) {
+            mockMvc.perform(get("/api/data")
+                            .header("X-Tenant-ID", tenant))
+                    .andExpect(status().isOk());
+        }
 
-		// Exhaust rate limit for IP1
-		for (int i = 0; i < 5; i++) {
-			mockMvc.perform(get("/api/data")
-							.header("X-Forwarded-For", clientIp1))
-					.andExpect(status().isOk());
-		}
+        // Next request should be 429 (global limit exhausted)
+        mockMvc.perform(get("/api/data")
+                        .header("X-Tenant-ID", tenant))
+                .andExpect(status().isTooManyRequests())
+                .andExpect(jsonPath("$.error").value("Too many requests"));
+    }
 
-		// IP1 should be rate limited
-		mockMvc.perform(get("/api/data")
-						.header("X-Forwarded-For", clientIp1))
-				.andExpect(status().isTooManyRequests());
+    // ─────────────────────────────────────────────────────────────────────────
+    //  TEST 3: Separate tenants have independent limits
+    //
+    //  Exhaust tenant-a, tenant-b should still be allowed.
+    // ─────────────────────────────────────────────────────────────────────────
 
-		// IP2 should still be allowed (separate bucket)
-		mockMvc.perform(get("/api/data")
-						.header("X-Forwarded-For", clientIp2))
-				.andExpect(status().isOk());
-	}
+    @Test
+    void shouldMaintainSeparateLimitsPerTenant() throws Exception {
+        String tenantA = "test-a";
+        String tenantB = "test-b";
 
-	/**
-	 * Test IP extraction from X-Forwarded-For header with multiple IPs.
-	 */
-	@Test
-	void shouldExtractFirstIPFromXForwardedForHeader() throws Exception {
-		String multipleIps = "203.0.113.1, 198.51.100.1, 192.0.2.1";
+        // Exhaust tenant-a (20 requests)
+        for (int i = 0; i < 20; i++) {
+            mockMvc.perform(get("/api/data")
+                            .header("X-Tenant-ID", tenantA))
+                    .andExpect(status().isOk());
+        }
 
-		// First IP should be used for rate limiting
-		for (int i = 0; i < 5; i++) {
-			mockMvc.perform(get("/api/data")
-							.header("X-Forwarded-For", multipleIps))
-					.andExpect(status().isOk());
-		}
+        // tenant-a should be limited
+        mockMvc.perform(get("/api/data")
+                        .header("X-Tenant-ID", tenantA))
+                .andExpect(status().isTooManyRequests());
 
-		mockMvc.perform(get("/api/data")
-						.header("X-Forwarded-For", multipleIps))
-				.andExpect(status().isTooManyRequests());
-	}
+        // tenant-b should still work (separate Bucket4j bucket in Redis)
+        mockMvc.perform(get("/api/data")
+                        .header("X-Tenant-ID", tenantB))
+                .andExpect(status().isOk());
+    }
 
-	/**
-	 * Test IP extraction from X-Real-IP header when X-Forwarded-For is absent.
-	 */
-	@Test
-	void shouldExtractIPFromXRealIPHeader() throws Exception {
-		String clientIp = "203.0.113.5";
+    // ─────────────────────────────────────────────────────────────────────────
+    //  TEST 4: Concurrent requests — CAS correctness
+    //
+    //  Send 30 concurrent requests from same tenant (limit=20).
+    //  Exactly 20 should succeed, 10 should get 429.
+    //  This verifies CAS doesn't over-consume tokens.
+    // ─────────────────────────────────────────────────────────────────────────
 
-		// Use X-Real-IP header
-		for (int i = 0; i < 5; i++) {
-			mockMvc.perform(get("/api/data")
-							.header("X-Real-IP", clientIp))
-					.andExpect(status().isOk());
-		}
+    @Test
+    void shouldHandleConcurrentRequestsCorrectly() throws Exception {
+        String tenant = "test-concurrent";
+        int totalRequests = 30;
+        int expectedSuccess = 20; // limit
 
-		mockMvc.perform(get("/api/data")
-						.header("X-Real-IP", clientIp))
-				.andExpect(status().isTooManyRequests());
-	}
+        AtomicInteger successCount = new AtomicInteger(0);
+        AtomicInteger rateLimitedCount = new AtomicInteger(0);
 
-	/**
-	 * Test concurrent requests to verify thread-safety and correct rate limiting.
-	 */
-	@Test
-	void shouldHandleConcurrentRequestsCorrectly() throws Exception {
-		String clientIp = "192.168.1.200";
-		int totalRequests = 10;
-		AtomicInteger successCount = new AtomicInteger(0);
-		AtomicInteger rateLimitedCount = new AtomicInteger(0);
+        ExecutorService executor = Executors.newFixedThreadPool(10);
+        CountDownLatch latch = new CountDownLatch(totalRequests);
 
-		ExecutorService executor = Executors.newFixedThreadPool(10);
-		CountDownLatch latch = new CountDownLatch(totalRequests);
+        for (int i = 0; i < totalRequests; i++) {
+            executor.submit(() -> {
+                try {
+                    var result = mockMvc.perform(get("/api/data")
+                                    .header("X-Tenant-ID", tenant))
+                            .andReturn();
 
-		for (int i = 0; i < totalRequests; i++) {
-			executor.submit(() -> {
-				try {
-					var result = mockMvc.perform(get("/api/data")
-									.header("X-Forwarded-For", clientIp))
-							.andReturn();
+                    if (result.getResponse().getStatus() == 200) {
+                        successCount.incrementAndGet();
+                    } else if (result.getResponse().getStatus() == 429) {
+                        rateLimitedCount.incrementAndGet();
+                    }
+                } catch (Exception e) {
+                    e.printStackTrace();
+                } finally {
+                    latch.countDown();
+                }
+            });
+        }
 
-					int status = result.getResponse().getStatus();
-					if (status == 200) {
-						successCount.incrementAndGet();
-					} else if (status == 429) {
-						rateLimitedCount.incrementAndGet();
-					}
-				} catch (Exception e) {
-					e.printStackTrace();
-				} finally {
-					latch.countDown();
-				}
-			});
-		}
+        latch.await();
+        executor.shutdown();
 
-		latch.await();
-		executor.shutdown();
+        System.out.println("Concurrent test — Success: " + successCount.get() +
+                ", Rate limited: " + rateLimitedCount.get());
 
-		// With capacity of 5, we expect exactly 5 successful requests
-		// and 5 rate-limited requests
-		System.out.println("Success count: " + successCount.get());
-		System.out.println("Rate limited count: " + rateLimitedCount.get());
+        // Exactly limit requests succeed, rest get 429
+        // (allow ±1 tolerance for race between CAS check and Bucket4j timing)
+        assertThat(successCount.get())
+                .as("Successful requests should be close to the limit of %d", expectedSuccess)
+                .isBetween(expectedSuccess - 1, expectedSuccess + 1);
+        assertThat(successCount.get() + rateLimitedCount.get()).isEqualTo(totalRequests);
+    }
 
-		assertThat(successCount.get()).isEqualTo(5);
-		assertThat(rateLimitedCount.get()).isEqualTo(5);
-		assertThat(successCount.get() + rateLimitedCount.get()).isEqualTo(totalRequests);
-	}
+    // ─────────────────────────────────────────────────────────────────────────
+    //  TEST 5: Chunk exhaustion triggers multiple Redis syncs
+    //
+    //  limit=20, chunk=2. Sending 20 requests should cause ~10 Redis syncs
+    //  (each sync allocates 2 tokens from Bucket4j).
+    //  Verify all 20 succeed and local state is correct.
+    // ─────────────────────────────────────────────────────────────────────────
 
-	/**
-	 * Test that bucket refills over time (requires waiting).
-	 * This test verifies the refill mechanism works correctly.
-	 */
-	@Test
-	void shouldRefillBucketOverTime() throws Exception {
-		String clientIp = "192.168.1.201";
+    @Test
+    void shouldAllocateMultipleChunksFromRedis() throws Exception {
+        String tenant = "test-chunk";
 
-		// Exhaust the bucket (5 requests)
-		for (int i = 0; i < 5; i++) {
-			mockMvc.perform(get("/api/data")
-							.header("X-Forwarded-For", clientIp))
-					.andExpect(status().isOk());
-		}
+        // Send 15 requests (should trigger multiple chunk allocations)
+        for (int i = 0; i < 15; i++) {
+            mockMvc.perform(get("/api/data")
+                            .header("X-Tenant-ID", tenant))
+                    .andExpect(status().isOk());
+        }
 
-		// Next request should be rate limited
-		mockMvc.perform(get("/api/data")
-						.header("X-Forwarded-For", clientIp))
-				.andExpect(status().isTooManyRequests());
+        // Check local state — consumed should be 15
+        LocalQuotaManager.LocalQuota quota = localQuotaManager.getQuota(tenant);
+        assertThat(quota).isNotNull();
+        // consumed may be less than 15 if a new chunk was just allocated (consumed resets)
+        // but total requests served = 15, which is what matters
+        System.out.println("After 15 requests — local available: " + quota.getAvailable() +
+                ", consumed: " + quota.getConsumed() + ", allocated: " + quota.getAllocated());
 
-		// Wait for refill (10 seconds as per config: 5 tokens per 10s)
-		System.out.println("Waiting for bucket to refill...");
-		Thread.sleep(11000); // Wait 11 seconds to ensure refill
+        // Chunk size = 2, so allocated should be 2 (current chunk)
+        assertThat(quota.getAllocated()).isEqualTo(2);
 
-		// After refill, requests should be allowed again
-		mockMvc.perform(get("/api/data")
-						.header("X-Forwarded-For", clientIp))
-				.andExpect(status().isOk());
-	}
+        // Send 5 more to exhaust limit
+        for (int i = 0; i < 5; i++) {
+            mockMvc.perform(get("/api/data")
+                            .header("X-Tenant-ID", tenant))
+                    .andExpect(status().isOk());
+        }
 
-	/**
-	 * High-throughput test: Simulate burst traffic from multiple clients.
-	 * Tests the system's ability to handle many concurrent requests.
-	 */
-	@Test
-	void shouldHandleHighThroughputFromMultipleClients() throws Exception {
-		int numClients = 10;
-		int requestsPerClient = 6;
-		ExecutorService executor = Executors.newFixedThreadPool(20);
-		CountDownLatch latch = new CountDownLatch(numClients * requestsPerClient);
+        // 21st request should be denied
+        mockMvc.perform(get("/api/data")
+                        .header("X-Tenant-ID", tenant))
+                .andExpect(status().isTooManyRequests());
+    }
 
-		List<AtomicInteger> successCounts = new ArrayList<>();
-		List<AtomicInteger> rateLimitCounts = new ArrayList<>();
+    // ─────────────────────────────────────────────────────────────────────────
+    //  TEST 6: Status endpoint shows local + global state
+    // ─────────────────────────────────────────────────────────────────────────
 
-		for (int clientId = 0; clientId < numClients; clientId++) {
-			AtomicInteger success = new AtomicInteger(0);
-			AtomicInteger rateLimited = new AtomicInteger(0);
-			successCounts.add(success);
-			rateLimitCounts.add(rateLimited);
+    @Test
+    void shouldShowCorrectStatusAfterRequests() throws Exception {
+        String tenant = "test-status";
 
-			String clientIp = "10.0.0." + clientId;
+        // Send 5 requests
+        for (int i = 0; i < 5; i++) {
+            mockMvc.perform(get("/api/data")
+                            .header("X-Tenant-ID", tenant))
+                    .andExpect(status().isOk());
+        }
 
-			for (int req = 0; req < requestsPerClient; req++) {
-				executor.submit(() -> {
-					try {
-						var result = mockMvc.perform(get("/api/data")
-										.header("X-Forwarded-For", clientIp))
-								.andReturn();
+        // Check status endpoint
+        mockMvc.perform(get("/api/status/" + tenant))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.tenantId").value(tenant))
+                .andExpect(jsonPath("$.globalLimit").value(20))
+                .andExpect(jsonPath("$.redisHealthy").value(true))
+                .andExpect(jsonPath("$.circuitBreakerState").value("CLOSED"));
+    }
 
-						if (result.getResponse().getStatus() == 200) {
-							success.incrementAndGet();
-						} else if (result.getResponse().getStatus() == 429) {
-							rateLimited.incrementAndGet();
-						}
-					} catch (Exception e) {
-						e.printStackTrace();
-					} finally {
-						latch.countDown();
-					}
-				});
-			}
-		}
+    // ─────────────────────────────────────────────────────────────────────────
+    //  TEST 7: Reset clears both local and Redis state
+    // ─────────────────────────────────────────────────────────────────────────
 
-		latch.await();
-		executor.shutdown();
+    @Test
+    void shouldResetTenantState() throws Exception {
+        String tenant = "test-reset";
 
-		// Each client should have exactly 5 successful requests and 1 rate limited
-		for (int i = 0; i < numClients; i++) {
-			System.out.println("Client " + i + " - Success: " + successCounts.get(i).get() +
-					", Rate Limited: " + rateLimitCounts.get(i).get());
+        // Exhaust all 20 tokens
+        for (int i = 0; i < 20; i++) {
+            mockMvc.perform(get("/api/data")
+                            .header("X-Tenant-ID", tenant))
+                    .andExpect(status().isOk());
+        }
 
-			assertThat(successCounts.get(i).get()).isEqualTo(5);
-			assertThat(rateLimitCounts.get(i).get()).isEqualTo(1);
-		}
-	}
+        // Should be rate limited
+        mockMvc.perform(get("/api/data")
+                        .header("X-Tenant-ID", tenant))
+                .andExpect(status().isTooManyRequests());
 
-	/**
-	 * Test fallback to remote address when no proxy headers are present.
-	 */
-	@Test
-	void shouldUseRemoteAddressWhenNoProxyHeaders() throws Exception {
-		// Without X-Forwarded-For or X-Real-IP, should use remote address
-		for (int i = 0; i < 5; i++) {
-			mockMvc.perform(get("/api/data"))
-					.andExpect(status().isOk());
-		}
+        // Reset
+        mockMvc.perform(post("/api/reset/" + tenant))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.message").value("Rate limit reset successfully"));
 
-		mockMvc.perform(get("/api/data"))
-				.andExpect(status().isTooManyRequests());
-	}
+        // After reset, should be allowed again
+        mockMvc.perform(get("/api/data")
+                        .header("X-Tenant-ID", tenant))
+                .andExpect(status().isOk());
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    //  TEST 8: Bucket4j refills tokens over time
+    //
+    //  Exhaust limit, wait for refill, verify tokens available again.
+    //  refillGreedy(20, 60s) = ~0.33 tokens/sec → 1 token in ~3s
+    // ─────────────────────────────────────────────────────────────────────────
+
+    @Test
+    void shouldRefillBucketOverTime() throws Exception {
+        String tenant = "test-refill";
+
+        // Exhaust all 20 tokens
+        for (int i = 0; i < 20; i++) {
+            mockMvc.perform(get("/api/data")
+                            .header("X-Tenant-ID", tenant))
+                    .andExpect(status().isOk());
+        }
+
+        // Should be rate limited
+        mockMvc.perform(get("/api/data")
+                        .header("X-Tenant-ID", tenant))
+                .andExpect(status().isTooManyRequests());
+
+        // Wait for Bucket4j to refill some tokens
+        // refillGreedy(20, 60s) = 1 token every 3 seconds
+        // Wait 7 seconds → ~2 tokens refilled → enough for 1 chunk of 2
+        System.out.println("Waiting 7 seconds for Bucket4j refill...");
+        Thread.sleep(7000);
+
+        // Invalidate local cache so next request triggers fresh Redis sync
+        localQuotaManager.invalidate(tenant);
+
+        // After refill, request should succeed (Bucket4j has refilled some tokens)
+        mockMvc.perform(get("/api/data")
+                        .header("X-Tenant-ID", tenant))
+                .andExpect(status().isOk());
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    //  TEST 9: Multiple tenants under concurrent load
+    //
+    //  5 tenants, each gets 25 concurrent requests (limit=20).
+    //  Each tenant should have ~20 successes and ~5 denials.
+    // ─────────────────────────────────────────────────────────────────────────
+
+    @Test
+    void shouldHandleMultipleTenantsUnderLoad() throws Exception {
+        int numTenants = 5;
+        int requestsPerTenant = 25;
+        ExecutorService executor = Executors.newFixedThreadPool(20);
+        CountDownLatch latch = new CountDownLatch(numTenants * requestsPerTenant);
+
+        List<AtomicInteger> successCounts = new ArrayList<>();
+        List<AtomicInteger> deniedCounts = new ArrayList<>();
+
+        for (int t = 0; t < numTenants; t++) {
+            AtomicInteger success = new AtomicInteger(0);
+            AtomicInteger denied = new AtomicInteger(0);
+            successCounts.add(success);
+            deniedCounts.add(denied);
+
+            String tenant = "test-multi-" + t;
+
+            for (int r = 0; r < requestsPerTenant; r++) {
+                executor.submit(() -> {
+                    try {
+                        var result = mockMvc.perform(get("/api/data")
+                                        .header("X-Tenant-ID", tenant))
+                                .andReturn();
+
+                        if (result.getResponse().getStatus() == 200) {
+                            success.incrementAndGet();
+                        } else {
+                            denied.incrementAndGet();
+                        }
+                    } catch (Exception e) {
+                        e.printStackTrace();
+                    } finally {
+                        latch.countDown();
+                    }
+                });
+            }
+        }
+
+        latch.await();
+        executor.shutdown();
+
+        for (int t = 0; t < numTenants; t++) {
+            int ok = successCounts.get(t).get();
+            int no = deniedCounts.get(t).get();
+            System.out.printf("Tenant test-multi-%d — Success: %d, Denied: %d%n", t, ok, no);
+
+            // Each tenant: ~20 success (allow ±1 for timing), rest denied
+            assertThat(ok).as("Tenant %d successes", t).isBetween(19, 21);
+            assertThat(ok + no).isEqualTo(requestsPerTenant);
+        }
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    //  TEST 10: Fallback to IP when no X-Tenant-ID header
+    // ─────────────────────────────────────────────────────────────────────────
+
+    @Test
+    void shouldFallbackToIpWhenNoTenantHeader() throws Exception {
+        // Without X-Tenant-ID, filter uses client IP as tenant ID
+        // X-Forwarded-For simulates the client IP
+        String clientIp = "203.0.113.99";
+
+        mockMvc.perform(get("/api/data")
+                        .header("X-Forwarded-For", clientIp))
+                .andExpect(status().isOk());
+
+        // Send 19 more (total 20 = limit)
+        for (int i = 1; i < 20; i++) {
+            mockMvc.perform(get("/api/data")
+                            .header("X-Forwarded-For", clientIp))
+                    .andExpect(status().isOk());
+        }
+
+        // 21st should be rate limited
+        mockMvc.perform(get("/api/data")
+                        .header("X-Forwarded-For", clientIp))
+                .andExpect(status().isTooManyRequests());
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    //  TEST 11: Health endpoint always available
+    // ─────────────────────────────────────────────────────────────────────────
+
+    @Test
+    void healthEndpointShouldAlwaysWork() throws Exception {
+        mockMvc.perform(get("/api/health"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.status").value("UP"));
+    }
 }

@@ -7,141 +7,210 @@ import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Component;
 
 import java.time.Duration;
-import java.util.concurrent.ConcurrentHashMap;
+import java.util.Set;
 import java.util.concurrent.atomic.AtomicLong;
-import java.util.concurrent.locks.ReentrantLock;
 
 /**
- * Thread-safe local quota manager using Caffeine cache.
- * Handles high-concurrency scenarios (5k+ simultaneous requests).
+ * Thread-safe local quota manager using Caffeine cache and CAS operations.
+ *
+ * ═══════════════════════════════════════════════════════════════════
+ *  HOW IT WORKS
+ * ═══════════════════════════════════════════════════════════════════
+ *
+ *  Each tenant gets a LocalQuota holding ONE chunk of tokens (10% of global limit).
+ *  Requests consume tokens via CAS loop — lock-free, handles 5k concurrent threads.
+ *
+ *  When available hits 0 → chunk exhausted → caller (HybridRateLimitService) calls
+ *  Bucket4j Redis to consume the NEXT chunk from the global token bucket.
+ *
+ *  FIELDS:
+ *   available     = tokens left in this chunk (CAS target — hot field)
+ *   consumed      = tokens used from this chunk (for observability)
+ *   allocated     = chunk size when it was allocated
+ *   globalLimit   = tenant's total limit per window
+ *   allocatedAtMs = when chunk was fetched from Redis (for slow-traffic expiry)
+ *
+ *  SLOW TRAFFIC CASE (rate=100/min, tenant sends 1 req/min):
+ *   Chunk of 10 allocated at 10:00. Consumed over 10 minutes.
+ *   But Bucket4j refills tokens continuously (100 tokens/60s = ~1.67/sec).
+ *   By 10:10 the Redis bucket has refilled 100 tokens 10 times.
+ *   If we hold the old chunk, we're blocking the tenant from using refilled tokens.
+ *   Fix: expire chunk if older than maxChunkAgeMs, return unused tokens, get fresh chunk.
  */
 @Component
 public class LocalQuotaManager {
 
     private static final Logger log = LoggerFactory.getLogger(LocalQuotaManager.class);
 
+    /**
+     * Max age of a local chunk before we consider it stale and re-fetch from Redis.
+     * This handles the slow-traffic case: if a chunk sits for longer than one full
+     * refill period, Bucket4j has refilled tokens we can't see from local cache.
+     *
+     * Set to the window duration (e.g. 60s). Configurable via setMaxChunkAgeMs().
+     */
+    private long maxChunkAgeMs = 60_000;
+
     private final Cache<String, LocalQuota> quotaCache;
-    private final ConcurrentHashMap<String, ReentrantLock> tenantLocks;
 
     public LocalQuotaManager() {
         this.quotaCache = Caffeine.newBuilder()
                 .maximumSize(10_000)
-                .expireAfterWrite(Duration.ofMinutes(2))
+                .expireAfterWrite(Duration.ofMinutes(5)) // cleanup inactive tenants
                 .recordStats()
                 .build();
-
-        this.tenantLocks = new ConcurrentHashMap<>();
     }
 
+    public void setMaxChunkAgeMs(long ms) {
+        this.maxChunkAgeMs = ms;
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    //  CONSUME — CAS loop, handles 5k concurrent threads
+    // ─────────────────────────────────────────────────────────────────────────
+
     /**
-     * Try to consume tokens from local cache (thread-safe).
+     * Try to consume 1 token from the local chunk.
+     *
+     * Returns:
+     *   ALLOW   → token consumed from local chunk (no Redis call needed)
+     *   DENY    → chunk exhausted (available=0), caller must sync Redis
+     *   EXPIRED → chunk too old (slow traffic), caller should return unused + re-fetch
+     *
+     * Thread safety:
+     *   CAS loop — only one thread wins per compareAndSet. Losers retry immediately
+     *   at CPU speed (~5ns per retry). No OS call, no blocking, no context switch.
      */
-    public boolean tryConsumeLocal(String tenantId, long tokens) {
+    public ConsumeResult tryConsume(String tenantId) {
         LocalQuota quota = quotaCache.getIfPresent(tenantId);
 
         if (quota == null) {
-            return false;
+            return ConsumeResult.DENY; // no chunk allocated yet
         }
 
-        // CAS loop: Lock-free atomic decrement
+        // ── Slow traffic expiry ──────────────────────────────────────────
+        // If this chunk has been sitting for longer than maxChunkAgeMs,
+        // Bucket4j has been refilling the Redis bucket during that time.
+        // We should discard this stale chunk and fetch a fresh one.
+        //
+        // Example: rate=100/min, chunk=10 tokens
+        //   Allocated at 10:00:00, it's now 10:01:30 (90 seconds later)
+        //   In 90 seconds Bucket4j refilled ~150 tokens in Redis
+        //   But locally we're still draining the original 10 tokens
+        //   This check forces a re-sync so the tenant isn't unfairly throttled
+        long age = System.currentTimeMillis() - quota.allocatedAtMs;
+        if (age > maxChunkAgeMs) {
+            log.debug("Chunk expired for tenant {} (age={}ms > max={}ms)", tenantId, age, maxChunkAgeMs);
+            return ConsumeResult.EXPIRED;
+        }
+
+        // ── CAS loop: atomically decrement available ─────────────────────
         while (true) {
             long current = quota.available.get();
 
-            if (current < tokens) {
-                log.debug("Local quota exhausted for tenant: {}", tenantId);
-                return false;
+            if (current <= 0) {
+                return ConsumeResult.DENY; // chunk fully consumed
             }
 
-            if (quota.available.compareAndSet(current, current - tokens)) {
-                quota.consumed.addAndGet(tokens);
-                log.trace("Consumed {} tokens for tenant: {}", tokens, tenantId);
-                return true;
+            if (quota.available.compareAndSet(current, current - 1)) {
+                quota.consumed.incrementAndGet();
+                return ConsumeResult.ALLOW;
             }
+            // CAS failed — another thread won this slot — spin immediately
+            Thread.onSpinWait();
         }
     }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    //  ALLOCATE — stamp a new chunk into local cache
+    // ─────────────────────────────────────────────────────────────────────────
 
     /**
-     * Allocate new quota chunk to local cache.
+     * Store a freshly-allocated chunk from Redis Bucket4j into local cache.
+     * Resets consumed counter, stamps allocatedAtMs for expiry tracking.
+     *
+     * Called only by the ONE thread holding the per-tenant lock in HybridRateLimitService.
      */
-    public void allocateQuota(String tenantId, long tokens) {
-        ReentrantLock lock = tenantLocks.computeIfAbsent(tenantId, k -> new ReentrantLock());
+    public void allocateChunk(String tenantId, long tokens, long globalLimit) {
+        long now = System.currentTimeMillis();
+        LocalQuota existing = quotaCache.getIfPresent(tenantId);
 
-        lock.lock();
-        try {
-            LocalQuota existing = quotaCache.getIfPresent(tenantId);
-
-            if (existing != null) {
-                existing.available.addAndGet(tokens);
-                existing.allocated.addAndGet(tokens);
-                log.info("Added {} tokens to tenant: {}", tokens, tenantId);
-            } else {
-                LocalQuota newQuota = new LocalQuota(tokens);
-                quotaCache.put(tenantId, newQuota);
-                log.info("Allocated new quota for tenant: {}", tenantId);
-            }
-        } finally {
-            lock.unlock();
+        if (existing != null) {
+            // Subsequent chunk: reset and top up
+            existing.available.set(tokens);
+            existing.allocated.set(tokens);
+            existing.consumed.set(0);
+            existing.globalLimit = globalLimit;
+            existing.allocatedAtMs = now;
+        } else {
+            // First chunk for this tenant on this pod
+            quotaCache.put(tenantId, new LocalQuota(tokens, globalLimit, now));
         }
+        log.info("Local chunk for tenant {}: {} tokens (limit={})", tenantId, tokens, globalLimit);
     }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    //  ACCESSORS
+    // ─────────────────────────────────────────────────────────────────────────
 
     public LocalQuota getQuota(String tenantId) {
         return quotaCache.getIfPresent(tenantId);
     }
 
-    /**
-     * Check if tenant needs sync with Redis.
-     */
-    public boolean needsSync(String tenantId, int syncThresholdPercent) {
-        LocalQuota quota = quotaCache.getIfPresent(tenantId);
-
-        if (quota == null) {
-            return true;
-        }
-
-        long allocated = quota.allocated.get();
-        long consumed = quota.consumed.get();
-        long threshold = (allocated * syncThresholdPercent) / 100;
-
-        return consumed >= threshold || quota.available.get() < 10;
+    /** Unused tokens in current chunk (for returning to Redis on expiry/shutdown) */
+    public long getUnusedTokens(String tenantId) {
+        LocalQuota q = quotaCache.getIfPresent(tenantId);
+        return q == null ? 0 : Math.max(0, q.available.get());
     }
 
-    public void resetQuota(String tenantId) {
+    public void invalidate(String tenantId) {
         quotaCache.invalidate(tenantId);
-        log.info("Reset local quota for tenant: {}", tenantId);
     }
 
     public void invalidateAll() {
         quotaCache.invalidateAll();
-        log.warn("Invalidated all local quotas");
+    }
+
+    public Set<String> getAllTenants() {
+        return quotaCache.asMap().keySet();
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    //  TYPES
+    // ─────────────────────────────────────────────────────────────────────────
+
+    public enum ConsumeResult {
+        ALLOW,    // token granted from local chunk
+        DENY,     // chunk empty, need Redis sync
+        EXPIRED   // chunk too old (slow traffic), return unused + re-fetch
     }
 
     /**
-     * Local quota holder with atomic counters.
+     * Holds ONE chunk of tokens for a tenant.
+     *
+     *  available     10 → 0   CAS target (AtomicLong)
+     *  consumed       0 → 10  incremented alongside available decrement
+     *  allocated      10      chunk size (set once per chunk)
+     *  globalLimit   100      tenant's per-window limit
+     *  allocatedAtMs epoch    when this chunk was grabbed from Redis
      */
     public static class LocalQuota {
-        public final AtomicLong allocated;
-        public final AtomicLong consumed;
         public final AtomicLong available;
-        public final AtomicLong lastSyncTime;
+        public final AtomicLong consumed;
+        public final AtomicLong allocated;
+        public volatile long globalLimit;
+        public volatile long allocatedAtMs;
 
-        public LocalQuota(long initialTokens) {
-            this.allocated = new AtomicLong(initialTokens);
-            this.consumed = new AtomicLong(0);
-            this.available = new AtomicLong(initialTokens);
-            this.lastSyncTime = new AtomicLong(System.currentTimeMillis());
+        public LocalQuota(long tokens, long globalLimit, long now) {
+            this.available     = new AtomicLong(tokens);
+            this.consumed      = new AtomicLong(0);
+            this.allocated     = new AtomicLong(tokens);
+            this.globalLimit   = globalLimit;
+            this.allocatedAtMs = now;
         }
 
-        public long getAvailable() {
-            return available.get();
-        }
-
-        public long getConsumed() {
-            return consumed.get();
-        }
-
-        public long getAllocated() {
-            return allocated.get();
-        }
+        public long getAvailable()  { return available.get(); }
+        public long getConsumed()   { return consumed.get(); }
+        public long getAllocated()  { return allocated.get(); }
     }
 }
-
