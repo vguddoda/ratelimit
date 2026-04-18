@@ -80,19 +80,24 @@ public class RedisQuotaManager {
     /**
      * Consume chunkSize tokens from the global Redis bucket for this tenant.
      *
+     * Returns a ChunkResult containing:
+     *   granted         = tokens actually granted (full chunk, partial, or 0)
+     *   nanosToWaitForRefill = how long until at least 1 token is available again
+     *                          (only meaningful when granted=0)
+     *
+     * Bucket4j's ConsumptionProbe gives us nanosToWaitForRefill — this is the KEY
+     * to avoiding pointless Redis calls after exhaustion:
+     *   60 tokens/min exhausted at t=30s → nanosToWait = ~1 second (until 1 token refills)
+     *   Caller caches this as deniedUntilMs → next 1 second: instant 429 from local, 0 Redis calls
+     *
      * CASES:
      *  1. Bucket has enough  → tryConsume(chunkSize) succeeds → return chunkSize
      *  2. Bucket has partial → probe shows remaining < chunkSize → consume remaining
-     *  3. Bucket empty       → return 0 (global limit exhausted)
+     *  3. Bucket empty       → return 0 + nanosToWait (caller caches denial)
      *
-     * INITIAL CASE:
-     *  First call ever: Bucket4j creates the bucket in Redis with full capacity.
-     *  So first tryConsume(10) with capacity=100 → succeeds, 90 remaining.
-     *
-     * ATOMICITY:
-     *  Bucket4j uses Redis CAS internally. Safe across all pods.
+     * ATOMICITY: Bucket4j uses Redis CAS internally. Safe across all pods.
      */
-    public long consumeChunk(String tenantId, long chunkSize, long globalLimit) {
+    public ChunkResult consumeChunk(String tenantId, long chunkSize, long globalLimit) {
         try {
             BucketProxy bucket = getOrCreateBucket(tenantId, globalLimit);
 
@@ -102,7 +107,7 @@ public class RedisQuotaManager {
             if (probe.isConsumed()) {
                 log.info("Bucket4j: granted {} tokens for tenant {} ({} remaining)",
                         chunkSize, tenantId, probe.getRemainingTokens());
-                return chunkSize;
+                return new ChunkResult(chunkSize, 0);
             }
 
             // Full chunk unavailable — try partial (take whatever is left)
@@ -112,17 +117,33 @@ public class RedisQuotaManager {
                 if (partial.isConsumed()) {
                     log.info("Bucket4j: granted PARTIAL {} tokens for tenant {} (0 remaining)",
                             remaining, tenantId);
-                    return remaining;
+                    return new ChunkResult(remaining, 0);
                 }
             }
 
-            log.warn("Bucket4j: global limit exhausted for tenant {}", tenantId);
-            return 0;
+            // Global limit exhausted — Bucket4j tells us exactly when next token arrives
+            long nanosToWait = probe.getNanosToWaitForRefill();
+            log.warn("Bucket4j: global limit exhausted for tenant {} (refill in {}ms)",
+                    tenantId, nanosToWait / 1_000_000);
+            return new ChunkResult(0, nanosToWait);
 
         } catch (Exception e) {
             log.error("Bucket4j error for tenant {}: {}", tenantId, e.getMessage());
             throw e; // let circuit breaker catch this
         }
+    }
+
+    /**
+     * Result from Bucket4j chunk consumption.
+     *
+     * @param granted          tokens granted (full, partial, or 0)
+     * @param nanosToWaitForRefill when granted=0, how many nanos until at least 1 token is available.
+     *                             Bucket4j computes this from the refill rate.
+     *                             Example: 60/min = 1/sec → nanosToWait ≈ 1_000_000_000 (1 second)
+     *                             Caller stores deniedUntilMs = now + nanos/1M to avoid pointless Redis calls.
+     */
+    public record ChunkResult(long granted, long nanosToWaitForRefill) {
+        public boolean isExhausted() { return granted == 0; }
     }
 
     /**

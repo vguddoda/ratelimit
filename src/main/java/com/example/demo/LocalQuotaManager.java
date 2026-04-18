@@ -8,34 +8,52 @@ import org.springframework.stereotype.Component;
 
 import java.time.Duration;
 import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicLong;
 
 /**
  * Thread-safe local quota manager using Caffeine cache and CAS operations.
  *
  * ═══════════════════════════════════════════════════════════════════
- *  HOW IT WORKS
+ *  HOW IT WORKS  (example: 60 tokens/min, chunk=10% = 6 tokens)
  * ═══════════════════════════════════════════════════════════════════
  *
- *  Each tenant gets a LocalQuota holding ONE chunk of tokens (10% of global limit).
+ *  Each tenant gets a LocalQuota holding ONE chunk of tokens (6 tokens).
  *  Requests consume tokens via CAS loop — lock-free, handles 5k concurrent threads.
  *
- *  When available hits 0 → chunk exhausted → caller (HybridRateLimitService) calls
- *  Bucket4j Redis to consume the NEXT chunk from the global token bucket.
+ *  Three possible results from tryConsume():
+ *
+ *   ALLOW   → token consumed from local chunk (no Redis call needed)
+ *
+ *   DENY    → available=0, chunk FULLY consumed
+ *             Nothing to return (all tokens used).
+ *             Caller calls syncAndConsume() → Bucket4j consume(6) → get next chunk.
+ *             Example: 6 tokens consumed in 5 seconds at 1 req/sec
+ *                      → DENY → sync → Bucket4j grants next 6 → continue
+ *
+ *   EXPIRED → chunk still has tokens but is OLDER than maxChunkAgeMs
+ *             Must RETURN unused tokens to Bucket4j (they were pre-consumed from Redis).
+ *             Then get a fresh chunk with current Bucket4j state.
+ *             Example: 6 tokens allocated, only 1 consumed in 2 minutes (slow traffic)
+ *                      → 5 unused → return 5 to Bucket4j → get fresh 6
  *
  *  FIELDS:
  *   available     = tokens left in this chunk (CAS target — hot field)
  *   consumed      = tokens used from this chunk (for observability)
- *   allocated     = chunk size when it was allocated
- *   globalLimit   = tenant's total limit per window
+ *   allocated     = chunk size when it was allocated (e.g. 6)
+ *   globalLimit   = tenant's total limit per window (e.g. 60)
  *   allocatedAtMs = when chunk was fetched from Redis (for slow-traffic expiry)
  *
- *  SLOW TRAFFIC CASE (rate=100/min, tenant sends 1 req/min):
- *   Chunk of 10 allocated at 10:00. Consumed over 10 minutes.
- *   But Bucket4j refills tokens continuously (100 tokens/60s = ~1.67/sec).
- *   By 10:10 the Redis bucket has refilled 100 tokens 10 times.
- *   If we hold the old chunk, we're blocking the tenant from using refilled tokens.
- *   Fix: expire chunk if older than maxChunkAgeMs, return unused tokens, get fresh chunk.
+ *  SLOW TRAFFIC CASE (60/min limit, tenant sends 1 req every 2 minutes):
+ *   Chunk of 6 allocated at 10:00.  Only 1 consumed by 10:02.
+ *   Bucket4j refills 1 token/sec → 120 tokens refilled in 120s → capped at 60.
+ *   If we keep the old chunk: tenant sees 5 tokens, but Redis has 60 available.
+ *   Fix: expire chunk after maxChunkAgeMs(60s), return 5 to Redis, get fresh 6.
+ *
+ *  FAST TRAFFIC CASE (60/min limit, tenant sends 1 req/sec):
+ *   Chunk of 6 consumed in 6 seconds → DENY (not EXPIRED, age=6s < 60s max)
+ *   → syncAndConsume → Bucket4j: had 54 + refilled ~6 = 60 → grant 6 → continue
+ *   Nothing to return because available=0 (all consumed).
  */
 @Component
 public class LocalQuotaManager {
@@ -52,6 +70,20 @@ public class LocalQuotaManager {
     private long maxChunkAgeMs = 60_000;
 
     private final Cache<String, LocalQuota> quotaCache;
+
+    /**
+     * Per-tenant denial cache: when Bucket4j says "exhausted, wait N nanos",
+     * we store deniedUntilMs = now + N/1M so subsequent requests get instant 429
+     * without any Redis call.
+     *
+     * Example: 60/min limit, all 60 consumed at t=30s
+     *   Bucket4j: nanosToWaitForRefill = ~1 billion ns (1 second until 1 token refills)
+     *   BUT we need chunkSize(6) tokens, not just 1 — so wait for chunkSize * refillInterval
+     *   deniedUntilMs = now + nanosToWait/1M
+     *   Next 1 second: any request → DENIED_CACHED → instant 429, zero Redis calls
+     *   After 1 second: denial expired → retry Bucket4j → maybe get partial/full chunk
+     */
+    private final ConcurrentHashMap<String, AtomicLong> deniedUntilMs = new ConcurrentHashMap<>();
 
     public LocalQuotaManager() {
         this.quotaCache = Caffeine.newBuilder()
@@ -73,15 +105,37 @@ public class LocalQuotaManager {
      * Try to consume 1 token from the local chunk.
      *
      * Returns:
-     *   ALLOW   → token consumed from local chunk (no Redis call needed)
-     *   DENY    → chunk exhausted (available=0), caller must sync Redis
-     *   EXPIRED → chunk too old (slow traffic), caller should return unused + re-fetch
+     *   ALLOW          → token consumed from local chunk (no Redis call needed)
+     *   DENY           → chunk exhausted (available=0), caller must sync Redis
+     *   EXPIRED        → chunk too old (slow traffic), caller should return unused + re-fetch
+     *   DENIED_CACHED  → Bucket4j already said "exhausted" recently, instant 429, NO Redis call
      *
      * Thread safety:
      *   CAS loop — only one thread wins per compareAndSet. Losers retry immediately
      *   at CPU speed (~5ns per retry). No OS call, no blocking, no context switch.
      */
     public ConsumeResult tryConsume(String tenantId) {
+
+        // ── Check denial cache FIRST (most important optimization) ────────
+        // If Bucket4j said "exhausted, wait N nanos", we cached that.
+        // Until that time passes, return instant 429 — zero Redis calls.
+        //
+        // Example: 60/min all used up at t=30s
+        //   Bucket4j: nanosToWait = 1 second (until 1 token refills)
+        //   deniedUntilMs = t=30s + 1s = t=31s
+        //   Requests from t=30s to t=31s: DENIED_CACHED → instant 429
+        //   Request at t=31s: denial expired → tryConsume → DENY → sync → Bucket4j may have tokens
+        AtomicLong deniedUntil = deniedUntilMs.get(tenantId);
+        if (deniedUntil != null) {
+            long until = deniedUntil.get();
+            if (until > 0 && System.currentTimeMillis() < until) {
+                log.debug("Denied (cached) for tenant {} until {}ms", tenantId, until);
+                return ConsumeResult.DENIED_CACHED;
+            }
+            // Denial expired — clear it so next attempt goes to Bucket4j
+            deniedUntil.set(0);
+        }
+
         LocalQuota quota = quotaCache.getIfPresent(tenantId);
 
         if (quota == null) {
@@ -165,10 +219,41 @@ public class LocalQuotaManager {
 
     public void invalidate(String tenantId) {
         quotaCache.invalidate(tenantId);
+        clearDenied(tenantId);
     }
 
     public void invalidateAll() {
         quotaCache.invalidateAll();
+        deniedUntilMs.clear();
+    }
+
+    /**
+     * Mark a tenant as denied until a specific time.
+     * Called when Bucket4j returns 0 tokens (global limit exhausted).
+     *
+     * @param tenantId    the tenant
+     * @param nanosToWait from Bucket4j's ConsumptionProbe.getNanosToWaitForRefill()
+     *                    This is how long until at LEAST 1 token refills.
+     *                    We need chunkSize tokens, so actual wait may be longer.
+     *                    But even waiting for 1 token's refill avoids pointless Redis calls.
+     *
+     * Example: 60/min, refill = 1 token/sec
+     *   All 60 consumed → nanosToWait = 1_000_000_000 (1 second for 1 token)
+     *   deniedUntilMs = now + 1000ms
+     *   Any request in next 1 second → DENIED_CACHED → instant 429
+     */
+    public void markDenied(String tenantId, long nanosToWait) {
+        long untilMs = System.currentTimeMillis() + (nanosToWait / 1_000_000);
+        deniedUntilMs.computeIfAbsent(tenantId, k -> new AtomicLong()).set(untilMs);
+        log.info("Tenant {} denied for {}ms (until refill)", tenantId, nanosToWait / 1_000_000);
+    }
+
+    /**
+     * Clear denial cache for a tenant (called after successful chunk allocation or reset).
+     */
+    public void clearDenied(String tenantId) {
+        AtomicLong d = deniedUntilMs.get(tenantId);
+        if (d != null) d.set(0);
     }
 
     public Set<String> getAllTenants() {
@@ -180,9 +265,10 @@ public class LocalQuotaManager {
     // ─────────────────────────────────────────────────────────────────────────
 
     public enum ConsumeResult {
-        ALLOW,    // token granted from local chunk
-        DENY,     // chunk empty, need Redis sync
-        EXPIRED   // chunk too old (slow traffic), return unused + re-fetch
+        ALLOW,          // token granted from local chunk
+        DENY,           // chunk empty, need Redis sync
+        EXPIRED,        // chunk too old (slow traffic), return unused + re-fetch
+        DENIED_CACHED   // Bucket4j said "exhausted" recently, instant 429, NO Redis call
     }
 
     /**
