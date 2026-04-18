@@ -13,9 +13,16 @@ With Bucket4j every request → 1 Redis call:
 
 **Fix:** Allocate tokens in *chunks* from Bucket4j Redis, serve most requests from local in-memory cache.
 
+**For all examples in this doc, assume a given tenant has:**
 ```
-Without chunking:  10,000 requests → 10,000 Redis calls (Bucket4j)
-With 10% chunks:   10,000 requests → ~10 Redis calls    (99% reduction)
+globalLimit = 60 tokens per minute
+chunkSize   = 10% of 60 = 6 tokens per chunk
+refill      = refillGreedy(60, 60s) = 1 token/second (continuous)
+```
+
+```
+Without chunking:  60 requests → 60 Redis calls (Bucket4j per request)
+With 10% chunks:   60 requests → 10 Redis calls (one per chunk of 6) → 83% reduction
 ```
 
 Bucket4j is still the source of truth — it manages the token bucket in Redis with proper

@@ -66,7 +66,7 @@ public class RedisQuotaManager {
     @Value("${rate.limit.window.duration:60}")
     private long windowDurationSeconds;
 
-    @Value("${rate.limit.default.limit:10000}")
+    @Value("${rate.limit.default.limit:60}")
     private long defaultLimit;
 
     public RedisQuotaManager(ProxyManager<String> proxyManager) {
