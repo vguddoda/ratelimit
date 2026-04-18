@@ -169,17 +169,49 @@ Request arrives at pod
 public class LocalQuotaManager {
 
     record LocalQuota(
-        AtomicLong available,   // Tokens available in this chunk
-        AtomicLong consumed,    // Tokens consumed from this chunk
-        AtomicLong allocated,   // Total chunk size allocated from Redis
-        volatile long lastSync  // Last Redis sync timestamp
-    ) {}
+        AtomicLong available,   // Tokens left in the current chunk (decremented by CAS)
+        AtomicLong consumed,    // Tokens consumed from current chunk (for flush trigger)
+        AtomicLong allocated,   // Size of the current chunk allocated from Redis
+        long       globalLimit, // ← ADDED: the tenant's total limit per window (e.g. 10,000)
+                                //   needed to compute chunkSize = globalLimit * 10%
+                                //   and the flush threshold = allocated (= 10% of globalLimit)
+        volatile long lastSync  // Last Redis sync timestamp (volatile for cross-thread visibility)
+    ) {
+        // Flush trigger: have we consumed the full chunk?
+        // allocated = 10% of globalLimit (e.g. 1,000 when limit=10,000)
+        // When consumed >= allocated, this chunk is exhausted → sync Redis
+        boolean isChunkExhausted() {
+            return consumed.get() >= allocated.get();
+        }
+
+        // What % of global limit has been consumed locally this chunk
+        // Useful for logging / observability
+        double consumedPercent() {
+            return (consumed.get() * 100.0) / globalLimit;
+        }
+    }
+
+    /*
+     * How the fields relate:
+     *
+     *  globalLimit = 10,000   ← tenant's total allowed per minute
+     *  allocated   =  1,000   ← chunk grabbed from Redis (10% of globalLimit)
+     *  consumed    =    0..1000 ← how many we've used from this chunk (CAS increments this)
+     *  available   =  1000..0  ← globalLimit - consumed (CAS decrements this)
+     *
+     *  Flush to Redis when:  consumed >= allocated  (chunk exhausted)
+     *  At that point exactly 10% of globalLimit was consumed locally without any Redis call.
+     *  Then grab the next chunk from Redis (another 10%).
+     *
+     *  Max Redis calls per window = globalLimit / chunkSize = 10,000 / 1,000 = 10 calls
+     *  vs. pure Redis approach   = 10,000 calls  (99% reduction)
+     */
 
     private final ConcurrentHashMap<String, LocalQuota> quotaCache = new ConcurrentHashMap<>();
 
     /**
      * CAS loop — lock-free, handles 5k concurrent threads on same tenant safely.
-     * Returns true if token consumed, false if local quota exhausted.
+     * Returns true if token consumed, false if chunk exhausted (caller must sync Redis).
      */
     public boolean tryConsume(String tenantId) {
         LocalQuota quota = quotaCache.get(tenantId);
@@ -189,33 +221,36 @@ public class LocalQuotaManager {
             long current = quota.available.get();
 
             if (current <= 0) {
-                return false;  // Need Redis sync — caller handles this
+                return false;  // Chunk exhausted → caller (HybridRateLimitService) syncs Redis
             }
 
             // Atomic: only succeeds if available is still `current`
-            // If another thread changed it between get() and here, CAS fails and we retry
+            // If another thread changed it between get() and here, CAS fails → retry
             if (quota.available.compareAndSet(current, current - 1)) {
                 quota.consumed.incrementAndGet();
                 return true;
             }
-            // CAS lost the race — another thread modified available first
-            // Spin and retry immediately (no blocking, no OS call)
+            // CAS lost the race — spin immediately, no OS call
         }
     }
 
-    public void allocateQuota(String tenantId, long tokens) {
+    public void allocateQuota(String tenantId, long tokens, long globalLimit) {
         quotaCache.compute(tenantId, (k, existing) -> {
             if (existing == null) {
+                // First allocation for this tenant
                 return new LocalQuota(
-                    new AtomicLong(tokens),
-                    new AtomicLong(0),
-                    new AtomicLong(tokens),
+                    new AtomicLong(tokens),   // available = full chunk
+                    new AtomicLong(0),        // consumed = 0
+                    new AtomicLong(tokens),   // allocated = chunk size
+                    globalLimit,              // total tenant limit — fixed per tenant
                     System.currentTimeMillis()
                 );
             }
+            // Subsequent chunk allocation: reset consumed, top up available
             existing.available.addAndGet(tokens);
-            existing.allocated.addAndGet(tokens);
-            existing.lastSync = System.currentTimeMillis();  // volatile write
+            existing.allocated.set(tokens);          // new chunk size
+            existing.consumed.set(0);                // reset — fresh chunk starts
+            existing.lastSync = System.currentTimeMillis();
             return existing;
         });
     }
