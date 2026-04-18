@@ -1,6 +1,17 @@
 # Rate Limiting System Design — Deep Dive
 
-Topics: APISIX setup, consistent hashing, hybrid local cache + Redis Bucket4j, CAS, failure handling
+> **Lock-free CAS** · **Consistent Hashing** (used by Kong, APISIX) · **Hybrid Local + Redis Bucket4j** · **Denial Cache** (Cloudflare-style instant 429) · **Circuit Breaker** · **Token Bucket / Leaky Bucket / Sliding Window**
+
+### 🔑 Key Techniques Used by Production Rate Limiters
+
+| Technique | Who Uses It | Why |
+|-----------|------------|-----|
+| **Consistent Hashing** | Kong, APISIX, Envoy | Route same tenant to same node → maximize local cache hits, minimize Redis calls |
+| **Lock-free CAS (Compare-And-Set)** | This design, Guava RateLimiter, Resilience4j | ~5ns atomic ops vs ~5μs for locks; zero context switches on hot path |
+| **Denial Cache (instant 429 without backend call)** | Cloudflare, this design | Once rate limit is hit, **all subsequent requests return 429 from local memory** — zero Redis/backend calls until the refill window. Cloudflare does this at edge PoPs to protect origin servers |
+| **Token Bucket with chunked allocation** | Stripe, this design | Batch Redis calls: 60 req/min → 10 Redis calls instead of 60 |
+| **Circuit Breaker on Redis** | This design, Resilience4j | Redis down → degrade gracefully, don't cascade failure |
+| **Sliding Window Log/Counter** | Redis-cell, Lyft ratelimit | More accurate than fixed window, avoids boundary burst problem |
 
 ---
 
@@ -550,4 +561,110 @@ curl http://localhost:8080/api/status/tenant-123
 #   9. 5 tenants × 25 concurrent requests each
 #  10. Fallback to IP when no X-Tenant-ID header
 #  11. Health endpoint always returns 200
+```
+
+---
+
+## 9. Rate Limiting Algorithms — Comparison
+
+### 1. Fixed Window Counter
+
+```
+Window: [0s–60s] → counter++ per request → reject if counter > limit
+Problem: Boundary burst — 60 reqs at t=59s + 60 reqs at t=61s = 120 in 2s
+```
+```
+  t=0s          t=59s  t=60s  t=61s          t=120s
+  |── window 1 ──|──────|── window 2 ──────────|
+                  60 reqs  60 reqs
+                  ↑ 120 requests in 2 seconds! ↑
+```
+**Used by:** Simple Redis INCR/EXPIRE, Nginx `limit_req` (basic mode)
+**Pros:** Simple, 1 Redis call (INCR)
+**Cons:** 2x burst at window boundary
+
+### 2. Sliding Window Log
+
+```
+Store timestamp of every request in a sorted set.
+On each request: remove entries older than window → count remaining → allow/deny
+
+ZADD   rate:tenant-123 <timestamp> <request-id>
+ZREMRANGEBYSCORE rate:tenant-123 0 (now - 60s)
+ZCARD  rate:tenant-123  → current count
+```
+**Used by:** Redis-based custom implementations
+**Pros:** Perfectly accurate, no boundary burst
+**Cons:** O(N) memory per tenant (stores every timestamp), expensive cleanup
+
+### 3. Sliding Window Counter (hybrid)
+
+```
+Weighted count = (previous window count × overlap%) + current window count
+
+Example: limit=60/min, previous window had 42 reqs, current window (15s in) has 18 reqs
+  overlap = (60-15)/60 = 75%
+  weighted = 42 × 0.75 + 18 = 49.5 → allow (< 60)
+```
+**Used by:** Lyft ratelimit, Cloudflare (variation), Redis-cell
+**Pros:** Near-perfect accuracy, O(1) memory (just 2 counters), no boundary burst
+**Cons:** Approximation (not exact)
+
+### 4. Leaky Bucket
+
+```
+Requests enter a queue (bucket). Processed at fixed rate. Overflow → reject.
+
+  ┌─── requests in ───┐
+  │                    │
+  │    [ queue/bucket ]│── overflow → 429
+  │    [  capacity=60 ]│
+  └────────┬───────────┘
+           │ drains at fixed rate (1/sec)
+           ▼
+       processed
+```
+**Used by:** Nginx `limit_req` (with burst), Shopify, network traffic shaping (TCP)
+**Pros:** Smooths traffic perfectly, fixed output rate
+**Cons:** No burst tolerance (legitimate spikes delayed), adds latency (queuing)
+
+### 5. Token Bucket ← **This design uses this**
+
+```
+Bucket fills at steady rate (refill). Requests consume tokens. Empty → reject.
+
+  [refill: 1 token/sec] → ┌────────────┐
+                           │ bucket     │
+                           │ cap=60     │
+                           │ tokens=45  │
+                           └─────┬──────┘
+                                 │ consume 1 per request
+                                 ▼
+                              allowed
+```
+**Used by:** AWS API Gateway, Stripe, Google Cloud, Bucket4j, Guava RateLimiter
+**Pros:** Allows controlled bursts (up to capacity), smooth average rate, flexible
+**Cons:** Slightly more complex than fixed window
+
+### Algorithm Comparison Table
+
+| Algorithm | Accuracy | Memory | Burst Handling | Complexity | Redis Calls/req |
+|-----------|----------|--------|----------------|------------|----------------|
+| Fixed Window | ⚠️ Boundary burst | O(1) | ❌ 2x at boundary | Simple | 1 (INCR) |
+| Sliding Window Log | ✅ Perfect | O(N) | ✅ No burst | Medium | 3 (ZADD+ZREM+ZCARD) |
+| Sliding Window Counter | ✅ ~99% accurate | O(1) | ✅ Weighted | Medium | 2 (GET prev+curr) |
+| Leaky Bucket | ✅ Perfect | O(1) | ❌ Queues bursts | Medium | 1 |
+| **Token Bucket** | ✅ Perfect | O(1) | ✅ Controlled burst | Medium | 1 |
+| **Token Bucket + Chunking (this design)** | ✅ Perfect | O(1) | ✅ Controlled burst | Higher | **0.17** (1 per 6 reqs) |
+
+### Why Token Bucket + Chunking + Denial Cache Wins
+
+```
+                        Fixed    Sliding   Sliding   Leaky    Token    This
+                        Window   Log       Counter   Bucket   Bucket   Design
+                        ─────    ───────   ───────   ──────   ──────   ──────
+Redis calls (60 req):    60        180       120       60       60       11
+Post-exhaust spam (5k):  5000      15000     10000     5000     5000     1 ← denial cache
+Burst at boundary:       YES       NO        NO        NO       NO       NO
+Burst tolerance:         YES       YES       YES       NO       YES      YES
 ```
