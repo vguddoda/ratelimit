@@ -30,15 +30,55 @@ import java.util.concurrent.locks.*;
  *   └─────────────────────────────────────────────┘
  *
  * COMPARED TO OTHER ALGORITHMS:
- *   ┌──────────────────┬──────────┬─────────┬──────────┬──────────────┐
- *   │ Algorithm        │ Burst    │ Memory  │ Smooth   │ Edge Reset   │
- *   ├──────────────────┼──────────┼─────────┼──────────┼──────────────┤
- *   │ Token Bucket     │ YES ✓    │ O(1)    │ Moderate │ No           │
- *   │ Leaky Bucket     │ NO       │ O(1)    │ YES ✓    │ No           │
- *   │ Fixed Window     │ YES ✓    │ O(1)    │ NO       │ YES (spike)  │
- *   │ Sliding Window   │ YES ✓    │ O(n)    │ YES ✓    │ No           │
- *   │ Sliding Counter  │ YES ✓    │ O(1)    │ YES ✓    │ No           │
- *   └──────────────────┴──────────┴─────────┴──────────┴──────────────┘
+ *   ┌───────────────────────┬──────────┬─────────┬──────────┬──────────────┐
+ *   │ Algorithm             │ Burst    │ Memory  │ Smooth   │ Edge Reset   │
+ *   ├───────────────────────┼──────────┼─────────┼──────────┼──────────────┤
+ *   │ Token Bucket          │ YES ✓    │ O(1)    │ Moderate │ No           │
+ *   │ Leaky Bucket          │ NO       │ O(1)    │ YES ✓    │ No           │
+ *   │ Fixed Window          │ YES ✓    │ O(1)    │ NO       │ YES (spike)  │
+ *   │ Sliding Window Log    │ YES ✓    │ O(n) *  │ YES ✓    │ No           │
+ *   │ Sliding Window Counter│ YES ✓    │ O(1) ** │ YES ✓    │ No           │
+ *   └───────────────────────┴──────────┴─────────┴──────────┴──────────────┘
+ *
+ *   * Sliding Window LOG — WHY O(n) memory:
+ *       Stores the EXACT TIMESTAMP of every request inside the current window.
+ *       Data structure used: Queue / LinkedList of timestamps, one per tenant.
+ *
+ *         window = 60 seconds, limit = 100 req/min
+ *         Queue → [t1=1000ms, t2=1200ms, t3=1800ms, ... t_n]
+ *                  ↑ one Long entry added per request
+ *
+ *       On each new request:
+ *         1. Evict all timestamps older than (now - 60s) from head of queue
+ *         2. Count remaining entries → that IS the current request count
+ *         3. count < limit  → ALLOW, append `now` to tail of queue
+ *            count >= limit → DENY
+ *
+ *       WHY memory grows:
+ *         Every allowed request adds one timestamp to the queue.
+ *         Queue size at any moment = number of requests in the window.
+ *           limit = 100 req/min   → queue holds up to 100 entries  per tenant
+ *           limit = 10,000 req/min → queue holds up to 10,000 entries per tenant
+ *         So n = max requests allowed per window → memory is O(n).
+ *
+ *         Token Bucket comparison: no matter how many requests come in,
+ *         it only ever stores 3 numbers (tokens, capacity, lastRefillTime) → O(1).
+ *
+ *   ** Sliding Window COUNTER — WHY O(1) memory:
+ *       Does NOT store individual timestamps. Uses a weighted approximation instead.
+ *       Data structure: just 3 fields per tenant (prevCount, currCount, windowStart).
+ *
+ *         Formula:
+ *           weight    = fraction of previous window still overlapping now  (0.0–1.0)
+ *           estimated = (prevCount × weight) + currCount
+ *
+ *         Example — limit=10, window=60s, currently 40s into new window:
+ *           weight    = (60 - 40) / 60 = 0.33  (33% of prev window still counts)
+ *           estimated = prevCount * 0.33 + currCount
+ *           if estimated < 10 → ALLOW
+ *
+ *         Memory is always just those 3 fields regardless of traffic volume → O(1).
+ *         Trade-off: ~0–1% estimation error at window boundary vs exact LOG approach.
  *
  * MULTI-TENANT:
  *   Each tenant has its own independent bucket stored in a ConcurrentHashMap.
