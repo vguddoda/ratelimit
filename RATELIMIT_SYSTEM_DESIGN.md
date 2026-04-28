@@ -1,22 +1,43 @@
 # Rate Limiting System Design — Deep Dive
 
-Topics: APISIX setup, consistent hashing, hybrid local+Redis algorithm, CAS in service, failure handling
+> **Lock-free CAS** · **Consistent Hashing** (used by Kong, APISIX) · **Hybrid Local + Redis Bucket4j** · **Denial Cache** (Cloudflare-style instant 429) · **Circuit Breaker** · **Token Bucket / Leaky Bucket / Sliding Window**
+
+### 🔑 Key Techniques Used by Production Rate Limiters
+
+| Technique | Who Uses It | Why |
+|-----------|------------|-----|
+| **Consistent Hashing** | Kong, APISIX, Envoy | Route same tenant to same node → maximize local cache hits, minimize Redis calls |
+| **Lock-free CAS (Compare-And-Set)** | This design, Guava RateLimiter, Resilience4j | ~5ns atomic ops vs ~5μs for locks; zero context switches on hot path |
+| **Denial Cache (instant 429 without backend call)** | Cloudflare, this design | Once rate limit is hit, **all subsequent requests return 429 from local memory** — zero Redis/backend calls until the refill window. Cloudflare does this at edge PoPs to protect origin servers |
+| **Token Bucket with chunked allocation** | Stripe, this design | Batch Redis calls: 60 req/min → 10 Redis calls instead of 60 |
+| **Circuit Breaker on Redis** | This design, Resilience4j | Redis down → degrade gracefully, don't cascade failure |
+| **Sliding Window Log/Counter** | Redis-cell, Lyft ratelimit | More accurate than fixed window, avoids boundary burst problem |
 
 ---
 
-## 1. Why Not Pure Redis?
+## 1. Why Not Pure Bucket4j?
 
 With Bucket4j every request → 1 Redis call:
 - 45k TPS = 45k Redis ops/sec
 - Redis is single-threaded; network RTT adds up
 - P99 latency dominated by Redis call overhead
 
-**Fix:** Allocate tokens in *chunks* from Redis, serve most requests from local in-memory cache.
+**Fix:** Allocate tokens in *chunks* from Bucket4j Redis, serve most requests from local in-memory cache.
+
+**For all examples in this doc, assume a given tenant has:**
+```
+globalLimit = 60 tokens per minute
+chunkSize   = 10% of 60 = 6 tokens per chunk
+refill      = refillGreedy(60, 60s) = 1 token/second (continuous)
+```
 
 ```
-Without chunking:  10,000 requests → 10,000 Redis calls
-With 10% chunks:   10,000 requests → ~10 Redis calls   (99% reduction)
+Without chunking:  60 requests → 60 Redis calls (Bucket4j per request)
+With 10% chunks:   60 requests → 10 Redis calls (one per chunk of 6) → 83% reduction
 ```
+
+Bucket4j is still the source of truth — it manages the token bucket in Redis with proper
+refill rate, capacity, atomicity. We just don't call it on every request.
 
 ---
 
@@ -72,7 +93,7 @@ upstreams:
         unhealthy: { interval: 1, http_failures: 2 }
 ```
 
-**Why headless K8s service?**  
+**Why headless K8s service?**
 `clusterIP: None` → APISIX sees individual pod IPs. Required for consistent hashing to route to a specific pod (not kube-proxy load balanced VIP).
 
 ```yaml
@@ -95,18 +116,18 @@ spec:
 ### Problem with Round-Robin
 
 ```
-tenant-123 → Pod 1 → cache miss → allocate 1000 from Redis
-tenant-123 → Pod 2 → cache miss → allocate 1000 from Redis  (WASTED!)
-tenant-123 → Pod 3 → cache miss → allocate 1000 from Redis  (WASTED!)
-Total allocated: 3000 for a tenant using maybe 300 requests
+tenant-123 → Pod 1 → cache miss → Bucket4j consume(10) → local: 10 tokens
+tenant-123 → Pod 2 → cache miss → Bucket4j consume(10) → local: 10 tokens (WASTED!)
+tenant-123 → Pod 3 → cache miss → Bucket4j consume(10) → local: 10 tokens (WASTED!)
+Total consumed from Bucket4j: 30 tokens for maybe 3 requests
 ```
 
 ### With Consistent Hashing
 
 ```
 tenant-123 → Pod 2 (always)
-  Request 1: cache miss → Redis allocate 1000
-  Request 2-1000: local cache hit — zero Redis calls
+  Request 1: cache miss → Bucket4j consume(10) → local: 10 tokens
+  Request 2-10: local cache hit — zero Redis calls
 Cache efficiency: 90%+
 ```
 
@@ -138,7 +159,55 @@ Scale 3 → 5 pods with consistent hash ring:
 
 ---
 
-## 4. Hybrid Local + Redis Algorithm
+## 4. Hybrid Local + Redis Bucket4j Algorithm
+
+### Config Used in All Examples Below
+
+```
+globalLimit    = 60 tokens per minute
+chunkSize      = 10% of 60 = 6 tokens per chunk
+Bucket4j refill = refillGreedy(60, 60s) = 1 token/second (continuous)
+maxChunkAge    = 60 seconds (= window duration)
+```
+
+### Architecture (3 layers)
+
+```
+Layer 1: LocalQuotaManager (CAS, in-memory, per-pod)
+  ↓ chunk exhausted / expired / no denial cached
+Layer 2: HybridRateLimitService (per-tenant ReentrantLock, circuit breaker)
+  ↓ calls
+Layer 3: RedisQuotaManager → Bucket4j ProxyManager (Token Bucket in Redis)
+```
+
+### The 4 Results from tryConsume() — KEY DISTINCTION
+
+```
+ALLOW         → token consumed from local chunk. Done. No Redis.
+DENY          → available=0. Chunk FULLY consumed. Nothing to return. Get next chunk from Bucket4j.
+EXPIRED       → chunk still has tokens but is OLD. Return unused to Bucket4j, then get fresh chunk.
+DENIED_CACHED → Bucket4j already said "exhausted" recently. Instant 429. ZERO Redis calls.
+```
+
+### Token Bucket in Redis (Bucket4j)
+
+```java
+BucketConfiguration.builder()
+    .addLimit(Bandwidth.builder()
+        .capacity(60)                // max burst: 60 tokens
+        .refillGreedy(60, 60s)       // 1 token/second continuous refill
+        .initialTokens(60)           // start with full bucket
+        .build())
+    .build();
+```
+
+Refill is GREEDY (continuous):
+```
+  t=0s:  60 tokens (full)
+  Consume 6: 54 left
+  t=6s:  54 + 6 refilled = 60 again (capped at capacity)
+  Refill rate: 60 tokens / 60 seconds = exactly 1 token/second
+```
 
 ### Token Allocation Flow
 
@@ -146,393 +215,456 @@ Scale 3 → 5 pods with consistent hash ring:
 Request arrives at pod
        │
        ▼
-  [Local Cache] ─── available > 0 ──► consume locally (NO Redis)
+  [LocalQuotaManager.tryConsume()]
        │
-     empty
+       ├── DENIED_CACHED → instant 429, ZERO Redis calls
+       │     (Bucket4j said "exhausted, wait Nms" earlier — still waiting)
        │
-       ▼
-  [Per-tenant lock] acquire
+       ├── ALLOW → CAS decremented local available → done (NO Redis)
        │
-       ▼
-  [Redis Lua script] allocate next chunk (10% of limit)
+       ├── DENY → chunk empty (available=0, all 6 tokens consumed)
+       │      │
+       │      ▼
+       │   [HybridRateLimitService.syncAndConsume()]
+       │      │
+       │      ├── tryLock(tenantId) → only 1 thread enters
+       │      │      │
+       │      │      ▼
+       │      │   [RedisQuotaManager.consumeChunk()]
+       │      │   Bucket4j.tryConsumeAndReturnRemaining(6)  ← 1 Redis call
+       │      │      │
+       │      │      ├── granted=6 → clearDenied, allocateChunk locally → serve
+       │      │      ├── granted=3 → partial chunk (end of budget) → serve
+       │      │      └── granted=0 → markDenied(nanosToWait) → 429
+       │      │                       ↑ cache "exhausted" locally
+       │      │                       next requests → DENIED_CACHED → instant 429
+       │      │
+       │      └── tryLock fails → wait 50ms → retry local
        │
-       ▼
-  Update local cache with new chunk
-       │
-       ▼
-  Release lock, serve request
+       └── EXPIRED → chunk too old (slow traffic)
+              │
+              ▼
+           Return unused to Bucket4j (addTokens)
+           Invalidate local chunk
+           syncAndConsume() → get fresh chunk
 ```
 
-### LocalQuotaManager — Core CAS Loop
+### LocalQuotaManager — CAS Loop (actual code, with denial cache)
 
 ```java
-public class LocalQuotaManager {
+public ConsumeResult tryConsume(String tenantId) {
 
-    record LocalQuota(
-        AtomicLong available,   // Tokens left in the current chunk (decremented by CAS)
-        AtomicLong consumed,    // Tokens consumed from current chunk (for flush trigger)
-        AtomicLong allocated,   // Size of the current chunk allocated from Redis
-        long       globalLimit, // ← ADDED: the tenant's total limit per window (e.g. 10,000)
-                                //   needed to compute chunkSize = globalLimit * 10%
-                                //   and the flush threshold = allocated (= 10% of globalLimit)
-        volatile long lastSync  // Last Redis sync timestamp (volatile for cross-thread visibility)
-    ) {
-        // Flush trigger: have we consumed the full chunk?
-        // allocated = 10% of globalLimit (e.g. 1,000 when limit=10,000)
-        // When consumed >= allocated, this chunk is exhausted → sync Redis
-        boolean isChunkExhausted() {
-            return consumed.get() >= allocated.get();
-        }
-
-        // What % of global limit has been consumed locally this chunk
-        // Useful for logging / observability
-        double consumedPercent() {
-            return (consumed.get() * 100.0) / globalLimit;
-        }
+    // ── Check denial cache FIRST (avoids ALL Redis calls when exhausted) ──
+    AtomicLong deniedUntil = deniedUntilMs.get(tenantId);
+    if (deniedUntil != null && System.currentTimeMillis() < deniedUntil.get()) {
+        return ConsumeResult.DENIED_CACHED;  // instant 429
     }
 
-    /*
-     * How the fields relate:
-     *
-     *  globalLimit = 10,000   ← tenant's total allowed per minute
-     *  allocated   =  1,000   ← chunk grabbed from Redis (10% of globalLimit)
-     *  consumed    =    0..1000 ← how many we've used from this chunk (CAS increments this)
-     *  available   =  1000..0  ← globalLimit - consumed (CAS decrements this)
-     *
-     *  Flush to Redis when:  consumed >= allocated  (chunk exhausted)
-     *  At that point exactly 10% of globalLimit was consumed locally without any Redis call.
-     *  Then grab the next chunk from Redis (another 10%).
-     *
-     *  Max Redis calls per window = globalLimit / chunkSize = 10,000 / 1,000 = 10 calls
-     *  vs. pure Redis approach   = 10,000 calls  (99% reduction)
-     */
+    LocalQuota quota = quotaCache.getIfPresent(tenantId);
+    if (quota == null) return ConsumeResult.DENY;
 
-    private final ConcurrentHashMap<String, LocalQuota> quotaCache = new ConcurrentHashMap<>();
-
-    /**
-     * CAS loop — lock-free, handles 5k concurrent threads on same tenant safely.
-     * Returns true if token consumed, false if chunk exhausted (caller must sync Redis).
-     */
-    public boolean tryConsume(String tenantId) {
-        LocalQuota quota = quotaCache.get(tenantId);
-        if (quota == null) return false;
-
-        while (true) {
-            long current = quota.available.get();
-
-            if (current <= 0) {
-                return false;  // Chunk exhausted → caller (HybridRateLimitService) syncs Redis
-            }
-
-            // Atomic: only succeeds if available is still `current`
-            // If another thread changed it between get() and here, CAS fails → retry
-            if (quota.available.compareAndSet(current, current - 1)) {
-                quota.consumed.incrementAndGet();
-                return true;
-            }
-            // CAS lost the race — spin immediately, no OS call
-        }
+    // Slow traffic expiry
+    if (System.currentTimeMillis() - quota.allocatedAtMs > maxChunkAgeMs) {
+        return ConsumeResult.EXPIRED;
     }
 
-    public void allocateQuota(String tenantId, long tokens, long globalLimit) {
-        quotaCache.compute(tenantId, (k, existing) -> {
-            if (existing == null) {
-                // First allocation for this tenant
-                return new LocalQuota(
-                    new AtomicLong(tokens),   // available = full chunk
-                    new AtomicLong(0),        // consumed = 0
-                    new AtomicLong(tokens),   // allocated = chunk size
-                    globalLimit,              // total tenant limit — fixed per tenant
-                    System.currentTimeMillis()
-                );
-            }
-            // Subsequent chunk allocation: reset consumed, top up available
-            existing.available.addAndGet(tokens);
-            existing.allocated.set(tokens);          // new chunk size
-            existing.consumed.set(0);                // reset — fresh chunk starts
-            existing.lastSync = System.currentTimeMillis();
-            return existing;
-        });
+    // CAS loop: atomically decrement available
+    while (true) {
+        long current = quota.available.get();
+        if (current <= 0) return ConsumeResult.DENY;
+
+        if (quota.available.compareAndSet(current, current - 1)) {
+            quota.consumed.incrementAndGet();
+            return ConsumeResult.ALLOW;
+        }
+        Thread.onSpinWait();
     }
 }
 ```
 
-### RedisQuotaManager — Lua Script (Atomic)
+### RedisQuotaManager — Returns nanosToWaitForRefill (actual code)
 
 ```java
-private static final String ALLOCATE_QUOTA_SCRIPT = """
-    local key = KEYS[1]
-    local requested = tonumber(ARGV[1])
-    local limit = tonumber(ARGV[2])
-    local window_ms = tonumber(ARGV[3])
-    local now = tonumber(ARGV[4])
+public ChunkResult consumeChunk(String tenantId, long chunkSize, long globalLimit) {
+    BucketProxy bucket = getOrCreateBucket(tenantId, globalLimit);
 
-    -- Expire old windows
-    local window_key = key .. ':' .. math.floor(now / window_ms)
+    ConsumptionProbe probe = bucket.tryConsumeAndReturnRemaining(chunkSize);
 
-    local consumed = tonumber(redis.call('HGET', window_key, 'consumed') or '0')
-    local available = limit - consumed
+    if (probe.isConsumed()) return new ChunkResult(chunkSize, 0);
 
-    if available <= 0 then
-        return 0
-    end
+    // Partial: take whatever remains
+    long remaining = probe.getRemainingTokens();
+    if (remaining > 0) {
+        ConsumptionProbe partial = bucket.tryConsumeAndReturnRemaining(remaining);
+        if (partial.isConsumed()) return new ChunkResult(remaining, 0);
+    }
 
-    local allocated = math.min(requested, available)
-    redis.call('HINCRBY', window_key, 'consumed', allocated)
-    redis.call('PEXPIRE', window_key, window_ms * 2)
-
-    return allocated
-    """;
-
-public long allocateQuota(String tenantId, long requestedChunk, long limit) {
-    String key = "ratelimit:" + tenantId;
-    long windowMs = 60_000;  // 1 minute window
-    long now = System.currentTimeMillis();
-
-    return redisTemplate.execute(
-        redisScript,
-        List.of(key),
-        String.valueOf(requestedChunk),
-        String.valueOf(limit),
-        String.valueOf(windowMs),
-        String.valueOf(now)
-    );
+    // Exhausted — return nanosToWait so caller can cache the denial
+    return new ChunkResult(0, probe.getNanosToWaitForRefill());
 }
+
+// granted=tokens granted, nanosToWaitForRefill=how long until 1 token refills
+public record ChunkResult(long granted, long nanosToWaitForRefill) {}
 ```
 
-**Why Lua?**
-- Entire script runs atomically in Redis (single-threaded Redis can't interleave)
-- No TOCTOU race: check-and-allocate is one operation
-- 1 network roundtrip instead of GET + SET (2 roundtrips)
-
-### HybridRateLimitService — Coordinator
+### HybridRateLimitService — syncAndConsume with denial caching (actual code)
 
 ```java
-@Service
-public class HybridRateLimitService {
+return circuitBreaker.executeSupplier(() -> {
+    long globalLimit = redisQuotaManager.getTenantLimit(tenantId);
+    long chunkSize = Math.max(1, (globalLimit * chunkPercent) / 100);
 
-    private static final double CHUNK_PERCENT = 0.10;
-    // Per-tenant lock to prevent thundering herd on Redis sync
-    private final ConcurrentHashMap<String, ReentrantLock> tenantLocks = new ConcurrentHashMap<>();
+    ChunkResult result = redisQuotaManager.consumeChunk(tenantId, chunkSize, globalLimit);
 
-    public boolean isAllowed(String tenantId) {
-        // Fast path: local cache serves >90% of requests
-        if (localQuotaManager.tryConsume(tenantId)) {
-            return true;
-        }
-
-        // Slow path: local exhausted, sync with Redis
-        return syncAndConsume(tenantId);
+    if (result.granted() > 0) {
+        localQuotaManager.clearDenied(tenantId);     // was denied before, now it's not
+        localQuotaManager.allocateChunk(tenantId, result.granted(), globalLimit);
+        return localQuotaManager.tryConsume(tenantId) == ConsumeResult.ALLOW;
     }
 
-    private boolean syncAndConsume(String tenantId) {
-        ReentrantLock lock = tenantLocks.computeIfAbsent(tenantId, k -> new ReentrantLock());
-
-        // tryLock: only ONE thread syncs with Redis, others spin on local briefly
-        if (!lock.tryLock()) {
-            // Another thread is syncing — give it a chance and retry local
-            Thread.onSpinWait();
-            return localQuotaManager.tryConsume(tenantId);
-        }
-
-        try {
-            // Double-check: maybe another thread already synced
-            if (localQuotaManager.tryConsume(tenantId)) {
-                return true;
-            }
-
-            // Allocate next chunk from Redis
-            long chunkSize = (long)(getLimit(tenantId) * CHUNK_PERCENT);
-            long allocated = circuitBreaker.executeSupplier(
-                () -> redisQuotaManager.allocateQuota(tenantId, chunkSize, getLimit(tenantId))
-            );
-
-            if (allocated > 0) {
-                localQuotaManager.allocateQuota(tenantId, allocated);
-                return localQuotaManager.tryConsume(tenantId);
-            }
-
-            return false;  // Global limit exhausted
-
-        } catch (Exception e) {
-            return handleDegradedMode(tenantId);
-        } finally {
-            lock.unlock();
-        }
-    }
-}
-```
-
-### What Happens with 5k Concurrent Requests
-
-```
-Time 0: local available = 1000
-
-Thread 1-1000:
-  All call tryConsume() simultaneously
-  All enter the CAS loop
-  Thread 1 reads current=1000, tries CAS(1000→999) → WINS
-  Thread 2 reads current=1000, tries CAS(1000→999) → FAILS (value is now 999)
-  Thread 2 retries: reads current=999, tries CAS(999→998) → WINS
-  ...continues until available=0
-
-Threads 1001-5000:
-  tryConsume() → available=0 → return false
-  Call syncAndConsume()
-  Only ONE thread acquires the ReentrantLock
-  That thread calls Redis, gets 1000 more tokens
-  Other 3999 threads: tryLock() fails → spin wait → retry local
-  After sync: next 1000 succeed, rest get 429
-
-RESULT: Exactly correct. No over-consumption. No deadlock.
+    // Exhausted: cache denial locally — next N ms get instant 429, no Redis
+    localQuotaManager.markDenied(tenantId, result.nanosToWaitForRefill());
+    return false;
+});
 ```
 
 ---
 
-## 5. Failure Scenarios
+## 5. Case Analysis (all cases: 60 tokens/min, chunk=6, refill=1/sec)
 
-### Redis Completely Down
-
-```
-Detection: Resilience4j CircuitBreaker
-  - failureRateThreshold=50 → opens at 50% failures
-  - windowSize=100 calls → tracks last 100 calls
-  - waitInOpenState=10s → tries recovery every 10s
-```
-
-```java
-CircuitBreakerConfig config = CircuitBreakerConfig.custom()
-    .failureRateThreshold(50)
-    .waitDurationInOpenState(Duration.ofSeconds(10))
-    .slidingWindowSize(100)
-    .build();
-
-private boolean handleDegradedMode(String tenantId) {
-    LocalQuota quota = localQuotaManager.getQuota(tenantId);
-
-    if (quota == null) {
-        // No local state, no Redis → fail closed (safe)
-        return false;
-    }
-
-    // Allow 10% of already-allocated local quota
-    // Prevents abuse while keeping existing tenants partially alive
-    long degradedLimit = quota.getAllocated() * 10 / 100;
-    return quota.getConsumed() < degradedLimit;
-}
-```
-
-**Decision by use case:**
-- Payment API → fail closed (`return false`) — security > availability
-- Public API → degraded mode (10%) — availability > strict accuracy
-- Internal API → fail open (`return true`) — trust internal traffic
-
-### Redis High Latency
-
-```java
-// Set 100ms timeout on Redis operations — fail fast instead of hanging
-RedisURI uri = RedisURI.Builder.redis(host, port)
-    .withTimeout(Duration.ofMillis(100))
-    .build();
-
-// Async with timeout
-try {
-    return CompletableFuture.supplyAsync(
-        () -> redisQuotaManager.allocateQuota(tenantId, chunkSize, limit)
-    ).get(100, TimeUnit.MILLISECONDS);
-} catch (TimeoutException e) {
-    return handleDegradedMode(tenantId);
-}
-```
-
-### Pod Crash
+### CASE 1: Initial Request (no local chunk)
 
 ```
-Data lost: local cache (all in-memory)
-Data safe: Redis (global state persisted)
-
-On crash:
-  K8s detects via liveness probe (30s max)
-  APISIX active health check detects in 2s
-  APISIX removes pod from hash ring
-  Consistent hash remaps affected tenants to other pods
-  New pod for tenant → cache miss → fresh Redis allocation
-  Possible over-allocation: ≤10% of limit (one lost chunk)
-
-On graceful shutdown (SIGTERM → PreDestroy):
+t=0s: First request. No local cache.
+tryConsume → DENY (quota=null)
+syncAndConsume:
+  Bucket4j: creates bucket with 60 tokens (initialTokens=60)
+  consumeChunk(6) → granted=6, 54 remaining in Redis
+  allocateChunk: available=6, consumed=0
+  tryConsume → ALLOW (available: 6→5)
+Redis calls: 1
 ```
+
+### CASE 2: Normal Steady Traffic (1 req/sec)
+
+```
+t=0s:  Req 1:  sync → Bucket4j consume(6) → local available=5    [1 Redis call]
+t=1s:  Req 2:  tryConsume → ALLOW (5→4)                           [0 Redis calls]
+t=2s:  Req 3:  ALLOW (4→3)
+t=3s:  Req 4:  ALLOW (3→2)
+t=4s:  Req 5:  ALLOW (2→1)
+t=5s:  Req 6:  ALLOW (1→0)
+t=6s:  Req 7:  DENY (available=0) → sync                          [1 Redis call]
+  Bucket4j: 54 remaining + ~6 refilled = 60 → consume(6) → 54 left
+  local: available=6 again
+t=7s:  Req 8:  ALLOW (5)                                          [0 Redis calls]
+...
+t=59s: Req 60: last request this minute
+
+TOTAL: 60 requests, 10 Redis calls (one per chunk of 6)
+Pure Bucket4j: 60 Redis calls → 83% reduction
+```
+
+### CASE 3: Chunk Exhausted in 5 Seconds (THE KEY CASE)
+
+```
+t=0s:   Chunk allocated: 6 tokens from Bucket4j (54 left in Redis)
+t=0-5s: 6 requests, each CAS-consumes 1 → available: 6→0
+
+t=5s:   Req 7: tryConsume → DENY (available=0)
+  → This is DENY (not EXPIRED): chunk is 5 seconds old < maxChunkAge(60s)
+  → Nothing to return: available=0, all 6 tokens were used
+  → syncAndConsume:
+      Bucket4j: 54 remaining + ~5 refilled (5s × 1/s) = ~59
+      consumeChunk(6) → granted=6, ~53 remaining
+      local: available=6 (fresh chunk)
+
+  WHY THIS IS CORRECT:
+    Chunk empty → just grab next chunk, no return needed
+    Bucket4j refilled ~5 tokens during those 5 seconds
+    Tenant used 12 of 60 → NOT rate-limited yet
+    Bucket4j enforces the global limit; we just batch the calls
+
+  Per minute at max rate (1 req/sec):
+    60 requests → 10 chunks × 6 tokens → 10 Redis calls
+    If tenant sends request #61 → Bucket4j returns 0 → 429
+```
+
+### CASE 4: Exhaustion + Denial Cache (the NEW optimization)
+
+```
+t=0s:   All 60 tokens consumed (10 chunks × 6 tokens, 10 Redis calls)
+
+t=0s:   Req 61: tryConsume → DENY (local empty) → syncAndConsume()
+  Bucket4j: 0 remaining, nanosToWaitForRefill = 1_000_000_000 (1 second)
+  → markDenied(tenantId, 1_000_000_000)
+  → deniedUntilMs = now + 1000ms
+  → return false → 429
+
+t=0.2s: Req 62: tryConsume → DENIED_CACHED (deniedUntilMs > now)
+  → instant 429, ZERO Redis calls ← THIS IS THE OPTIMIZATION
+
+t=0.5s: Req 63: tryConsume → DENIED_CACHED → instant 429
+
+t=1.0s: Req 64: tryConsume → denial expired (deniedUntilMs < now)
+  → DENY → syncAndConsume()
+  → Bucket4j: 1 token refilled (1 second × 1/sec)
+  → consumeChunk(6) → only 1 available → partial grant(1)
+  → local: available=1 → serve 1 request → then DENY again
+
+WITHOUT denial cache:
+  Reqs 61-100 at t=0-1s: 40 Redis calls, all returning 0 → wasted
+WITH denial cache:
+  Req 61: 1 Redis call (discovers exhaustion)
+  Reqs 62-100: DENIED_CACHED → ZERO Redis calls
+  Req 64 at t=1s: 1 Redis call (denial expired, retry)
+  TOTAL: 2 Redis calls instead of 40 → 95% reduction in wasted calls
+```
+
+### CASE 5: Slow Traffic (1 req every 2 minutes)
+
+```
+t=0:00: Req 1: no local → sync → Bucket4j consume(6) → local available=5
+  Bucket4j: 60-6 = 54 remaining
+
+t=2:00: Req 2 (120s later):
+  tryConsume: DENIED_CACHED? No (no denial set). Check quota.
+  Chunk age = 120s > maxChunkAge(60s) → EXPIRED
+
+  EXPIRED PATH (different from DENY):
+    1. Return 5 unused tokens to Bucket4j: addTokens(5)
+       Bucket4j: refilled to 60 long ago + 5 returned → still 60 (capped)
+    2. Invalidate local chunk
+    3. syncAndConsume: Bucket4j consume(6) → granted=6 → local: available=5
+
+t=4:00: Req 3: EXPIRED again → return 5 → re-sync → fresh chunk
+
+  WHY EXPIRED RETURNS TOKENS (DENY DOES NOT):
+    DENY:    available=0 → nothing to return → just get next chunk
+    EXPIRED: available=5 → those 5 were pre-consumed from Bucket4j but never used
+             Return them so they're not wasted
+
+  WHY NOT KEEP OLD CHUNK:
+    Bucket4j refills 1/sec. After 120s → fully refilled to 60.
+    Old chunk: tenant sees 5 tokens, unaware that Redis has 60.
+    Expiry → re-sync → tenant gets fresh view of actual capacity.
+```
+
+### CASE 6: Burst (5000 concurrent requests)
+
+```
+5000 threads arrive at t=0s, local available=0
+
+All → DENY → syncAndConsume()
+Thread 1 wins tryLock → Bucket4j consume(6) → local: 6
+Threads 2-6: wait 50ms → retry local → CAS → ALLOW (6→0)
+Thread 7 wins next lock → Bucket4j consume(6) → local: 6
+...
+After 10 syncs: 10 × 6 = 60 tokens → all 60 allowed
+Thread 61: Bucket4j returns 0 → markDenied → 429
+Threads 62-5000: DENIED_CACHED → instant 429, zero Redis calls
+
+Redis calls: 11 (10 grants + 1 denial)
+Without denial cache: ~4990 Redis calls all returning 0
+```
+
+### CASE 7: Pod Shutdown
 
 ```java
 @PreDestroy
-public void flushOnShutdown() {
-    localQuotaManager.getAllTenants().forEach(tenantId -> {
-        LocalQuota quota = localQuotaManager.getQuota(tenantId);
-        if (quota != null) {
-            long unused = quota.available.get();
-            if (unused > 0) {
-                // Return unused tokens to Redis so they're not wasted
-                redisTemplate.opsForHash().increment(
-                    "ratelimit:" + tenantId, "consumed", -unused
-                );
-            }
+public void shutdown() {
+    for (String tenantId : localQuotaManager.getAllTenants()) {
+        long unused = localQuotaManager.getUnusedTokens(tenantId);
+        if (unused > 0) {
+            redisQuotaManager.returnTokens(tenantId, unused, limit);
         }
-    });
+    }
+    localQuotaManager.invalidateAll();
 }
 ```
 
-### Redis Cluster Split-Brain
+### CASE 8: Redis Down
 
-```yaml
-# redis.conf — require quorum before accepting writes
-min-replicas-to-write 2
-min-replicas-max-lag 10
-
-# Sentinel config — automatic failover
-sentinel monitor mymaster 127.0.0.1 6379 2
-sentinel down-after-milliseconds mymaster 5000
-sentinel failover-timeout mymaster 10000
 ```
-
-```java
-// Detect split-brain — check cluster_state
-public boolean isRedisHealthy() {
-    String info = redisConnection.sync().clusterInfo();
-    return info.contains("cluster_state:ok");
-}
+CircuitBreaker opens after 50% failure in last 100 Redis calls.
+degradedMode: allow degradedPercent% of existing local chunk.
+  chunk=6, degradedPercent=10 → buffer = 0.6 → 0 → deny all
+  (For larger limits: chunk=1000, 10% = 100 → meaningful buffer)
+After 10s: CB half-open → 5 test calls → Redis back → CLOSED
 ```
 
 ---
 
-## 6. Failure Summary Table
+## 6. Failure Summary
 
 | Failure | Detection | Impact | Recovery |
 |---------|-----------|--------|----------|
 | Redis down | Circuit breaker (2-10s) | Degraded mode | Auto — CB half-open retry |
-| Redis slow | Timeout (100ms) | Slight latency | Auto — fail fast to local |
-| Pod crash | Liveness probe (30s) / APISIX (2s) | Traffic reroute + one lost chunk | Auto — K8s restart |
-| Network partition | Cluster health check | Inconsistent quotas | Manual — resolve partition |
-| Pod scaling (3→6) | Immediate | ~16% cache misses (ring) | 1-2 min stabilize |
-| Burst (5k reqs) | None needed | CAS handles atomically | N/A |
+| Redis slow | Timeout (500ms) | Slight latency | Auto — fail fast |
+| Pod crash | APISIX health (2s) | Reroute + 1 lost chunk | Auto — K8s restart |
+| Pod scale 3→6 | Immediate | ~16% cache misses | 1-2 min stabilize |
+| 5k concurrent | None needed | CAS + denial cache | N/A |
+| Slow traffic | Chunk expiry (60s) | Re-sync | Auto — return unused |
+| Post-exhaustion spam | Denial cache | **Zero Redis calls** | Auto — expires on refill |
 
 ---
 
 ## 7. Interview Q&A
 
-**Q: How does consistent hashing differ from round-robin modulo?**
-> Modulo: `hash(tenant) % N` — changing N remaps ~50% of keys. Consistent ring: adding 1 node remaps only `1/N` keys. This is critical for local cache efficiency — we want the same tenant always hitting the same pod.
+**Q: Who makes the final rate limit decision — local cache or Redis?**
+> Always Bucket4j (Redis). Local cache is only a *batch optimization*. It holds pre-consumed tokens that Bucket4j already approved. When local is empty, we go to Bucket4j. When Bucket4j says "exhausted", that's final — we cache that denial locally to avoid redundant Redis calls. Local cache NEVER overrides Bucket4j.
 
-**Q: Why CAS instead of synchronized for 5k concurrent threads?**
-> `synchronized` puts threads to sleep (OS context switch, ~5μs overhead). CAS retries at CPU speed (~5ns per retry). For tiny operations like `available--`, CAS is 100x cheaper under contention. See benchmarks: synchronized=50k TPS, CAS=200k TPS for same operation.
+**Q: What happens after all 60 tokens are used at t=30s? The next 30 seconds?**
+> Bucket4j returns `nanosToWaitForRefill` (e.g. 1 second). We store `deniedUntilMs = now + 1s`. All requests in that 1s → `DENIED_CACHED` → instant 429 from local memory. After 1s: denial expires, we call Bucket4j again. If 1 token refilled, we get a partial chunk. Repeat. No wasted Redis calls.
 
-**Q: Why Lua scripts for Redis allocation?**
-> Without Lua: GET → compute → HINCRBY is 3 separate commands; another thread can interleave between them (TOCTOU race). Lua runs as a single atomic unit in Redis's single-threaded event loop. Also reduces 3 network roundtrips to 1.
+**Q: 60 tokens/min with chunk=6 — how many Redis calls per minute?**
+> Normal: 10 calls (60/6). With post-exhaustion denial cache, even in burst scenarios: ~11 calls (10 grants + 1 denial). Without denial cache a burst of 5000 requests after exhaustion would cause ~4990 wasted Redis calls all returning 0.
 
-**Q: What is the max over-allocation possible?**
-> Per pod: 1 chunk = 10% of limit. For 3 pods: 30% max over-allocation globally. This is acceptable because rate limiting is probabilistic. The alternative — syncing every request — costs 99% more Redis calls.
+**Q: DENY vs EXPIRED — when does each happen?**
+> DENY = `available=0`, chunk fully consumed within maxChunkAge. All tokens used, nothing to return. Just get next chunk from Bucket4j.
+> EXPIRED = chunk still has tokens but is older than maxChunkAge (60s). Slow traffic: tenant didn't use all tokens. Must return unused to Bucket4j (they were pre-consumed from Redis). Then get fresh chunk.
 
-**Q: How do you handle clock skew across pods?**
-> Use Redis TIME command for window boundaries. All pods query Redis for current time (cached for 1s). No local `System.currentTimeMillis()` for window calculation.
+**Q: Why not just use a fixed-window counter in Redis (INCR/EXPIRE)?**
+> Fixed window has burst-at-boundary problem: 60 requests at t=59s + 60 at t=61s = 120 in 2 seconds. Token bucket with greedy refill handles this correctly — tokens accumulate gradually, burst capacity is naturally limited by the bucket capacity.
 
-**Q: What happens to in-flight requests when a pod crashes?**
-> In-flight requests are dropped (connection reset). K8s readiness probe stops new traffic before SIGTERM. The PreDestroy hook returns unused local tokens to Redis. Net result: ≤10% token loss (one chunk), no global state corruption.
+**Q: Why `addTokens()` instead of just letting Bucket4j refill naturally?**
+> Without `addTokens()`: 5 unused tokens from an expired chunk are "consumed" in Bucket4j but never used. Tenant effectively gets 55/min instead of 60/min. With `addTokens()`: those 5 go back, bucket capacity stays accurate. Especially important for slow-traffic tenants.
 
+---
+
+## 8. Testing
+
+```bash
+# Start Redis + app
+docker run -d -p 6379:6379 redis:latest
+./mvnw spring-boot:run
+
+# Basic request (creates Bucket4j bucket + first chunk)
+curl -H "X-Tenant-ID: tenant-123" http://localhost:8080/api/data
+
+# Check status (local vs global state)
+curl http://localhost:8080/api/status/tenant-123
+
+# Run all integration tests (11 tests)
+./mvnw test -Dtest=DemoApplicationTests
+
+# Tests use limit=20, chunk=2 for speed.
+# Cases tested:
+#   1. Basic request allowed
+#   2. Rate limit enforced at 20 requests
+#   3. Separate tenants have independent limits
+#   4. 30 concurrent requests → exactly 20 succeed (CAS correctness)
+#   5. Multi-chunk flow (chunk=2, 15 requests → multiple Redis syncs)
+#   6. Status endpoint shows correct state
+#   7. Reset clears both local + Redis
+#   8. Bucket4j refill: exhaust → wait 7s → tokens available again
+#   9. 5 tenants × 25 concurrent requests each
+#  10. Fallback to IP when no X-Tenant-ID header
+#  11. Health endpoint always returns 200
+```
+
+---
+
+## 9. Rate Limiting Algorithms — Comparison
+
+### 1. Fixed Window Counter
+
+```
+Window: [0s–60s] → counter++ per request → reject if counter > limit
+Problem: Boundary burst — 60 reqs at t=59s + 60 reqs at t=61s = 120 in 2s
+```
+```
+  t=0s          t=59s  t=60s  t=61s          t=120s
+  |── window 1 ──|──────|── window 2 ──────────|
+                  60 reqs  60 reqs
+                  ↑ 120 requests in 2 seconds! ↑
+```
+**Used by:** Simple Redis INCR/EXPIRE, Nginx `limit_req` (basic mode)
+**Pros:** Simple, 1 Redis call (INCR)
+**Cons:** 2x burst at window boundary
+
+### 2. Sliding Window Log
+
+```
+Store timestamp of every request in a sorted set.
+On each request: remove entries older than window → count remaining → allow/deny
+
+ZADD   rate:tenant-123 <timestamp> <request-id>
+ZREMRANGEBYSCORE rate:tenant-123 0 (now - 60s)
+ZCARD  rate:tenant-123  → current count
+```
+**Used by:** Redis-based custom implementations
+**Pros:** Perfectly accurate, no boundary burst
+**Cons:** O(N) memory per tenant (stores every timestamp), expensive cleanup
+
+### 3. Sliding Window Counter (hybrid)
+
+```
+Weighted count = (previous window count × overlap%) + current window count
+
+Example: limit=60/min, previous window had 42 reqs, current window (15s in) has 18 reqs
+  overlap = (60-15)/60 = 75%
+  weighted = 42 × 0.75 + 18 = 49.5 → allow (< 60)
+```
+**Used by:** Lyft ratelimit, Cloudflare (variation), Redis-cell
+**Pros:** Near-perfect accuracy, O(1) memory (just 2 counters), no boundary burst
+**Cons:** Approximation (not exact)
+
+### 4. Leaky Bucket
+
+```
+Requests enter a queue (bucket). Processed at fixed rate. Overflow → reject.
+
+  ┌─── requests in ───┐
+  │                    │
+  │    [ queue/bucket ]│── overflow → 429
+  │    [  capacity=60 ]│
+  └────────┬───────────┘
+           │ drains at fixed rate (1/sec)
+           ▼
+       processed
+```
+**Used by:** Nginx `limit_req` (with burst), Shopify, network traffic shaping (TCP)
+**Pros:** Smooths traffic perfectly, fixed output rate
+**Cons:** No burst tolerance (legitimate spikes delayed), adds latency (queuing)
+
+### 5. Token Bucket ← **This design uses this**
+
+```
+Bucket fills at steady rate (refill). Requests consume tokens. Empty → reject.
+
+  [refill: 1 token/sec] → ┌────────────┐
+                           │ bucket     │
+                           │ cap=60     │
+                           │ tokens=45  │
+                           └─────┬──────┘
+                                 │ consume 1 per request
+                                 ▼
+                              allowed
+```
+**Used by:** AWS API Gateway, Stripe, Google Cloud, Bucket4j, Guava RateLimiter
+**Pros:** Allows controlled bursts (up to capacity), smooth average rate, flexible
+**Cons:** Slightly more complex than fixed window
+
+### Algorithm Comparison Table
+
+| Algorithm | Accuracy | Memory | Burst Handling | Complexity | Redis Calls/req |
+|-----------|----------|--------|----------------|------------|----------------|
+| Fixed Window | ⚠️ Boundary burst | O(1) | ❌ 2x at boundary | Simple | 1 (INCR) |
+| Sliding Window Log | ✅ Perfect | O(N) | ✅ No burst | Medium | 3 (ZADD+ZREM+ZCARD) |
+| Sliding Window Counter | ✅ ~99% accurate | O(1) | ✅ Weighted | Medium | 2 (GET prev+curr) |
+| Leaky Bucket | ✅ Perfect | O(1) | ❌ Queues bursts | Medium | 1 |
+| **Token Bucket** | ✅ Perfect | O(1) | ✅ Controlled burst | Medium | 1 |
+| **Token Bucket + Chunking (this design)** | ✅ Perfect | O(1) | ✅ Controlled burst | Higher | **0.17** (1 per 6 reqs) |
+
+### Why Token Bucket + Chunking + Denial Cache Wins
+
+```
+                        Fixed    Sliding   Sliding   Leaky    Token    This
+                        Window   Log       Counter   Bucket   Bucket   Design
+                        ─────    ───────   ───────   ──────   ──────   ──────
+Redis calls (60 req):    60        180       120       60       60       11
+Post-exhaust spam (5k):  5000      15000     10000     5000     5000     1 ← denial cache
+Burst at boundary:       YES       NO        NO        NO       NO       NO
+Burst tolerance:         YES       YES       YES       NO       YES      YES
+```
